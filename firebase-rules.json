@@ -1,0 +1,18 @@
+{
+  "rules": {
+    "salas": {
+      ".read": "auth != null",
+      ".write": "auth != null",
+      ".indexOn": [
+        "creadaEn",
+        "creadorUid"
+      ]
+    },
+    "estadisticas": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid"
+      }
+    }
+  }
+}
