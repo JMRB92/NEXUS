@@ -1,5 +1,6 @@
-/* NEXUS v1.02 — motor conservado, persistencia defensiva y revanchas.
-   Firebase Spark + GitHub Pages. La lógica del navegador NO es antifraude total. */
+/* Juego de Cartas JDT — versión consolidada
+   Firebase compat. La entrada a sala NO usa transacciones en el nodo completo.
+   Los errores se muestran con operación, código y mensaje reales. */
 (() => {
   "use strict";
 
@@ -9,94 +10,59 @@
   let auth, db, user = null, currentCode = null, roomRef = null, roomCallback = null, statsRef = null, statsCallback = null;
   let room = null, selectedCard = null, busy = false, playCardBusy = false, endTurnBusy = false;
   let catalogDetailReturn = false;
-  const Core = window.NexusCore;
-  const ROOM_TTL_MS=Core.ROOM_TTL_MS, REMATCH_MS=Core.REMATCH_MS;
-  const ROOM_LIMIT=3, CREATE_COOLDOWN_MS=20000;
-  let serverOffset=0, closingRoom=false;
-  const indexedFinals = new Set();
-  const serverNow=()=>Date.now()+serverOffset;
-  const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
   function showScreen(id) {
-    const changed=!!$(id)?.classList.contains("hidden");
     screens.forEach(s => { const el=$(s); if(el) el.classList.toggle("hidden",s!==id); });
-    if(changed)window.scrollTo({top:0,behavior:"smooth"});
+    window.scrollTo({top:0,behavior:"smooth"});
   }
   function say(text="") { const el=$("mensaje-global"); if(el) el.textContent=text; }
   function setStatus(text, cls="") { const el=$("estado-conexion"); if(el){el.textContent=text;el.className="connection "+cls;} }
   function fail(op, err) {
     console.error(`[${op}]`, err?.code || "", err?.message || err, err);
-    const code=String(err?.code||'').toLowerCase();
-    if(code.includes('permission_denied'))say(`${op}: Firebase ha rechazado la operación por permisos. Comprueba las reglas de seguridad publicadas.`);
-    else if(code.includes('network')||code.includes('disconnected'))say(`${op}: No hay conexión. Comprueba Internet y vuelve a intentarlo.`);
-    else if(code.startsWith('auth/'))say(`${op}: Error de autenticación. Reabre la aplicación.`);
-    else say(`${op}: ${String(err?.message||err||'Operación no disponible').slice(0,240)}`);
+    say(`${op}: ${err?.code ? err.code+" — " : ""}${err?.message || String(err)}`);
   }
-  // Contadores globales ocultos. El incremento es sencillo y se ejecuta en el servidor.
-  // Spark no garantiza que un cliente malicioso no pueda falsificarlos.
-  async function incrementStat(field) {
-    if(!user || !db)throw new Error('Es necesaria una sesión válida para registrar estadísticas.');
-    await db.ref(`estadisticasGlobales/${field}`).set(firebase.database.ServerValue.increment(1));
+  // Registro persistente por usuario. Cada partida se contabiliza una sola vez
+  // mediante una transacción atómica en el nodo de estadísticas.
+  function updateStatsUI(stats={}) {
+    const created=$('estadisticas-creadas'), finished=$('estadisticas-finalizadas');
+    if(created)created.textContent=String(Number(stats.partidasCreadas||0));
+    if(finished)finished.textContent=String(Number(stats.partidasFinalizadas||0));
+  }
+  async function recordStatOnce(kind, key) {
+    if(!db || !user?.uid)throw new Error('No hay conexión de usuario para registrar estadísticas.');
+    const field=kind==='creada'?'partidasCreadas':'partidasFinalizadas';
+    const safeKey=String(key).replace(/[^a-zA-Z0-9_-]/g,'_');
+    const result=await db.ref(`estadisticas/${user.uid}`).transaction(stats=>{
+      stats=stats||{};
+      const records=stats.registros||{};
+      const bucket=records[kind]||{};
+      if(bucket[safeKey]===true)return;
+      bucket[safeKey]=true;records[kind]=bucket;stats.registros=records;
+      stats[field]=Math.max(0,Number(stats[field]||0))+1;
+      return stats;
+    },undefined,false);
+    if(!result.committed && result.snapshot.child(`registros/${kind}/${safeKey}`).val()!==true)
+      throw new Error('No se confirmó el registro de estadísticas.');
   }
   async function registerCreatedRoomOnce(code) {
-    // El código es nuevo porque se ha reservado con una transacción atómica.
-    try {await incrementStat('salasCreadas');}
-    catch(e){console.warn('No se pudo contabilizar la nueva sala',code,e);}
+    await recordStatOnce('creada',code);
   }
   async function registerFinishedRoomOnce(code, data) {
-    if(!user||!data?.jugadores?.[user.uid]||data.juego?.estado!=='finalizada')return;
-    const key=`${code}_${Number(data.numeroPartida||1)}`;
-    const marker=db.ref(`eventosContabilizados/${code}/${Number(data.numeroPartida||1)}`);
-    // Solo una pestaña del anfitrión puede reclamar cada evento. El contador sigue
-    // siendo un incremento simple; una caída entre ambas escrituras puede perderlo.
-    const claim=await marker.transaction(value=>value===null?1:undefined,undefined,false);
-    if(claim.committed) {
-      try {await incrementStat('partidasFinalizadas');}
-      catch(e){console.warn('No se pudo contabilizar el resultado final',key,e);}
-    }
-    // El índice de limpieza no depende del contador. Evita escrituras repetidas
-    // cuando los observadores reciben varias actualizaciones de la misma partida.
-    if(indexedFinals.has(key))return;
-    indexedFinals.add(key);
-    try {await db.ref(`salasFinalizadas/${code}`).update({
-      creadaEn:data.creadaEn, finalizadaEn:data.juego.finalizadaEn||serverNow(),
-      creadorUid:data.creadorUid, numeroPartida:Number(data.numeroPartida||1)
-    });} catch(e){indexedFinals.delete(key);console.warn('No se pudo indexar la sala finalizada',code,e);}
+    if(!user || !data || data.creadorUid!==user.uid || data.juego?.estado!=='finalizada')return;
+    await recordStatOnce('finalizada',`${code}_partida_${Number(data.numeroPartida||1)}`);
   }
-  async function reserveCreationSlot(code) {
-    const list=db.ref(`usuarioSalas/${user.uid}`);
-    const snap=await list.once('value');
-    const known=snap.val()||{};
-    for(const oldCode of Object.keys(known)) {
-      const exists=await db.ref(`salas/${oldCode}`).once('value').then(s=>s.val()).catch(()=>null);
-      if(!exists || exists.estado==='cerrada' || Core.shouldDelete(exists,serverNow()))
-        await list.child(oldCode).remove().catch(()=>{});
-    }
-    const result=await list.transaction(value=>{
-      value=value||{};
-      if(value[code]||Object.keys(value).length>=ROOM_LIMIT)return;
-      value[code]=serverNow();return value;
-    },undefined,false);
-    if(!result.committed)throw new Error('Has alcanzado el máximo de tres salas activas.');
-  }
-  async function creationCooldown() {
-    const ref=db.ref(`limiteUsuarios/${user.uid}/ultimaCreacionEn`);
-    const now=serverNow();
-    const result=await ref.transaction(previous=>{
-      if(Number(previous||0)>now-CREATE_COOLDOWN_MS)return;
-      return now;
-    },undefined,false);
-    if(!result.committed)throw new Error('Espera 20 segundos antes de crear otra sala.');
-  }
-  async function commitGame(before, next, guard=()=>true) {
-    const expected=Number(before.version||0);
-    const action=Core.code()+String(serverNow());
-    const result=await db.ref(`salas/${currentCode}/juego`).transaction(actual=>{
-      if(!actual || Number(actual.version||0)!==expected || !guard(actual))return;
-      return cleanFirebaseValue({...next,version:expected+1,ultimaAccionId:action});
-    },undefined,false);
-    if(!result.committed)throw new Error('La partida se ha actualizado desde otro dispositivo. Se ha cancelado esta acción para evitar sobrescribir cartas.');
-    return result.snapshot.val();
+  async function reconcileCreatorStats() {
+    if(!user || !db)return;
+    const snap=await db.ref('salas').orderByChild('creadorUid').equalTo(user.uid).once('value');
+    const jobs=[];
+    snap.forEach(child=>{
+      const data=child.val();
+      if(['1.29','1.30','1.31','1.32'].includes(data?.versionCreacion)) {
+        jobs.push(registerCreatedRoomOnce(child.key));
+        if(data.juego?.estado==='finalizada')jobs.push(registerFinishedRoomOnce(child.key,data));
+      }
+    });
+    await Promise.all(jobs);
   }
   // Firebase Realtime Database rechaza propiedades con valor undefined.
   // Algunas resoluciones (por ejemplo, una carta Guerrero sin adivinación) podían
@@ -112,8 +78,14 @@
     }
     return value;
   }
-  function randomCode() { return Core.code(); }
-  function validateName(name) { Core.safeName(name); }
+  function randomCode() {
+    const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    return Array.from({length:6},()=>chars[Math.floor(Math.random()*chars.length)]).join("");
+  }
+  function validateName(name) {
+    if(!name) throw new Error("Escribe tu nombre.");
+    if(name.length>20) throw new Error("El nombre no puede superar los 20 caracteres.");
+  }
   async function ensureUser() {
     if(auth.currentUser) { user=auth.currentUser; return user; }
     const cred=await auth.signInAnonymously();
@@ -123,74 +95,42 @@
     if(roomRef && roomCallback) roomRef.off("value",roomCallback);
     roomRef=null; roomCallback=null;
   }
-  async function deleteRoomIfEligible(code, data=null) {
-    if(!data){try{data=(await db.ref(`salas/${code}`).once('value')).val();}catch(_){return false;}}
-    if(!data)return true;
-    if(!Core.shouldDelete(data,serverNow()))return false;
-    try {
-      await db.ref(`salas/${code}`).remove();
-      await db.ref(`salasFinalizadas/${code}`).remove().catch(()=>{});
+  const ROOM_TTL_MS=48*60*60*1000;
+  async function expireRoomIfNeeded(code, data) {
+    const created=Number(data?.creadaEn||0);
+    if(created>0 && Date.now()-created>=ROOM_TTL_MS) {
+      try { await db.ref(`salas/${code}`).remove(); } catch(e) { console.warn('No se pudo borrar una sala caducada',code,e); }
       return true;
-    }catch(e){console.warn('La limpieza no pudo eliminar la sala',code,e);return false;}
-  }
-  async function expireRoomIfNeeded(code,data) {
-    if(!Core.shouldDelete(data,serverNow()))return false;
-    await deleteRoomIfEligible(code,data);
-    return true;
+    }
+    return false;
   }
   async function cleanupExpiredRooms() {
-    if(!db||!user)return;
+    if(!db)return;
     try {
-      // La consulta del servidor solo permite leer salas de más de 48 horas.
-      const cutoff=serverNow()-ROOM_TTL_MS-60000; // margen frente al reloj del servidor
-      const snap=await db.ref('salas').orderByChild('creadaEn').endAt(cutoff).limitToFirst(50).once('value');
-      for(const child of Object.values(snap.val()||{})){
-        if(child?.codigo)await deleteRoomIfEligible(child.codigo,child);
-      }
-    } catch(e){console.warn('La limpieza por antigüedad no está disponible con las reglas actuales.',e);}
-    try {
-      // Solo las salas FINALIZADAS aparecen en este índice sin cartas privadas.
-      const finals=(await db.ref('salasFinalizadas').orderByChild('creadorUid').equalTo(user.uid).once('value')).val()||{};
-      for(const [code,info] of Object.entries(finals)) {
-        const first=Number(info.primeraSolicitudEn||0);
-        const base=first>=Number(info.finalizadaEn||0)?first:Number(info.finalizadaEn||0);
-        const deadline=Math.min(Number(info.creadaEn||0)+ROOM_TTL_MS,base+REMATCH_MS);
-        if(!base||serverNow()<deadline)continue;
-        // La regla del servidor comprueba también que la sala siga finalizada.
-        await db.ref(`salas/${code}`).remove().then(()=>db.ref(`salasFinalizadas/${code}`).remove()).catch(()=>{});
-      }
-    }catch(e){console.warn('La limpieza de partidas finalizadas no pudo completarse.',e);}
+      const cutoff=Date.now()-ROOM_TTL_MS;
+      const snap=await db.ref('salas').orderByChild('creadaEn').endAt(cutoff).once('value');
+      const jobs=[];
+      snap.forEach(child=>{const created=Number(child.child('creadaEn').val()||0);if(created>0&&created<=cutoff)jobs.push(db.ref(`salas/${child.key}`).remove());});
+      await Promise.all(jobs);
+      if(jobs.length)console.info(`Limpieza de salas: ${jobs.length} sala(s) con más de 48 horas eliminadas.`);
+    } catch(e) { console.warn('Limpieza automática de salas no disponible; revisa el índice Firebase salas.creadaEn.',e); }
   }
   function listen(code) {
     detach(); currentCode=code; roomRef=db.ref(`salas/${code}`);
-    try{localStorage.setItem('nexus.ultimaSala',code);}catch(_){}
     roomCallback=snap=>{
-      if(!snap.exists()){
-        const last=readSavedResult(code);
-        detach();room=null;currentCode=null;
-        if(last){renderSavedResult(last);say('La sala ya no está disponible. Se conserva el último resultado en este dispositivo.');}
-        else{say('La sala ya no existe o ha caducado.');showScreen('pantalla-inicio');}
+      if(!snap.exists()){say("La sala ya no existe o ha caducado.");detach();showScreen("pantalla-inicio");return;}
+      const data=snap.val(),created=Number(data?.creadaEn||0);
+      if(created>0&&Date.now()-created>=ROOM_TTL_MS){
+        expireRoomIfNeeded(code,data).finally(()=>{say('La sala ha caducado porque han pasado 48 horas desde su creación.');detach();showScreen('pantalla-inicio');});
         return;
       }
-      const data=snap.val();
-      if(Core.shouldDelete(data,serverNow())){
-        expireRoomIfNeeded(code,data).finally(()=>{
-          if(currentCode===code){detach();room=null;currentCode=null;showScreen('pantalla-inicio');say('La sala ha caducado.');}
-        });return;
-      }
-      room=data;room.codigo=code;
-      if(typeof room.reingresoAbierto!=='boolean')room.reingresoAbierto=true;
-      if(room.estado==='jugando')renderGame();else renderLobby();
-      if(data.jugadores?.[user?.uid] && data.juego?.estado==='finalizada')
-        registerFinishedRoomOnce(code,data).catch(e=>console.warn('Estadística de fin no disponible',e));
+      room=data; room.codigo=code;
+      if(typeof room.reingresoAbierto!=='boolean') room.reingresoAbierto=true;
+      if(room.estado==="jugando") renderGame(); else renderLobby();
+      if(data.creadorUid===user?.uid && data.juego?.estado==='finalizada') registerFinishedRoomOnce(code,data).catch(e=>console.warn('No se pudo actualizar el contador de partidas finalizadas',e));
     };
-    roomRef.on('value',roomCallback,err=>{
-      console.warn('No se pudo leer la sala',err);
-      const saved=readSavedResult(code);
-      detach();room=null;currentCode=null;
-      if(saved)renderSavedResult(saved);else{showScreen('pantalla-inicio');say('Ya no tienes acceso a esta sala.');}
-    });
-    if(user)db.ref(`salas/${code}/jugadores/${user.uid}/conectado`).onDisconnect().set(false).catch(()=>{});
+    roomRef.on("value",roomCallback,err=>fail("No se pudo leer la sala",err));
+    if(user) db.ref(`salas/${code}/jugadores/${user.uid}/conectado`).onDisconnect().set(false).catch(()=>{});
   }
   function playersOf(data=room) { return Object.values(data?.jugadores || {}); }
   function renderLobby() {
@@ -214,7 +154,9 @@
   function makeDeck(playerCount=0) {
     // En partidas de dos jugadores se retiran estas 11 cartas del mazo completo.
     // Se excluyen antes de quemar/repartir, por lo que tampoco pueden aparecer en rondas posteriores.
-    const ids=Core.cardsForPlayers(Number(playerCount));
+    const idsCompletos=["01","02","11","12","13","14","15","16","17","18","21","22","23","31","32","33","41","42","43","51","52","61","62","71","72","81","91"];
+    const excluidasDosJugadores=new Set(["01","02","12","13","18","22","33","42","61","71","91"]);
+    const ids=Number(playerCount)===2?idsCompletos.filter(id=>!excluidasDosJugadores.has(id)):idsCompletos;
     return ids.map((id,i)=>({id,value:Number(id[0]),name:cardName(id),characteristic:CARD_META[id]?.[1]||"Carta",character:CARD_META[id]?.[2]||"",effect:cardEffect(id),image:`assets/cartas/${id}.jpg`,uid:`${id}-${i}`}));
   }
   const CARD_META = {
@@ -353,12 +295,12 @@
     try{
       const snap=await db.ref(`salas/${currentCode}`).once('value'),data=snap.val(),g=data?.juego;
       if(!g||g.estado==='finalizada'||g.turnoUid!==user.uid||!g.temporizadorActivo||g.partidaPausada)return;
-      const elapsed=serverNow()-Number(g.turnoStartedAt||serverNow()),remaining=Number(g.tiempoRestanteMs??120000)-elapsed;
+      const elapsed=Date.now()-Number(g.turnoStartedAt||Date.now()),remaining=Number(g.tiempoRestanteMs??120000)-elapsed;
       if(remaining>0)return;
-      const before=structuredClone(g);g.manos[user.uid]=[];g.cartaJugada=true;g.cartaRobada=true;
+      g.manos[user.uid]=[];g.cartaJugada=true;g.cartaRobada=true;
       addHistoryEntry(g,`${data.jugadores?.[user.uid]?.nombre||'El jugador'} agotó los 2 minutos y queda eliminado de la ronda.`,'effect');
       g.eventoVisual={id:Date.now()+Math.random(),tipo:'ataque',texto:`${data.jugadores?.[user.uid]?.nombre||'El jugador'} agotó el tiempo y queda eliminado de la ronda.`};
-      await commitGame(before,g,latest=>latest.turnoUid===user.uid&&latest.estado==='jugando');await endTurn();
+      await db.ref(`salas/${currentCode}/juego`).set(cleanFirebaseValue(g));await endTurn();
     }catch(e){console.warn('No se pudo aplicar el límite de tiempo',e);}
     finally{timeoutInProgress=false;}
   }
@@ -369,7 +311,7 @@
     pause.textContent=game.partidaPausada?'Reanudar partida':'Pausar partida';
     if(!active){label.textContent='';return;}
     if(game.partidaPausada){label.textContent=`PARTIDA PAUSADA · Quedaban ${formatClock(Number(game.tiempoRestanteMs||120000))}`;return;}
-    const elapsed=serverNow()-Number(game.turnoStartedAt||serverNow()),left=Math.max(0,Number(game.tiempoRestanteMs??120000)-elapsed);
+    const elapsed=Date.now()-Number(game.turnoStartedAt||Date.now()),left=Math.max(0,Number(game.tiempoRestanteMs??120000)-elapsed);
     label.textContent=`Tiempo restante: ${formatClock(left)}`;
     if(left<=0&&game.turnoUid===user?.uid)handleTimeout();
   }
@@ -378,124 +320,69 @@
     try{
       const snap=await db.ref(`salas/${currentCode}`).once('value'),data=snap.val(),g=data?.juego;
       if(!g||!g.temporizadorActivo||g.estado==='finalizada')return;
-      const before=structuredClone(g);
-      if(!g.partidaPausada){const elapsed=serverNow()-Number(g.turnoStartedAt||serverNow());g.tiempoRestanteMs=Math.max(0,Number(g.tiempoRestanteMs??120000)-elapsed);g.partidaPausada=true;}
-      else {g.partidaPausada=false;g.turnoStartedAt=serverNow();}
+      if(!g.partidaPausada){const elapsed=Date.now()-Number(g.turnoStartedAt||Date.now());g.tiempoRestanteMs=Math.max(0,Number(g.tiempoRestanteMs??120000)-elapsed);g.partidaPausada=true;}
+      else {g.partidaPausada=false;g.turnoStartedAt=Date.now();}
       addHistoryEntry(g,g.partidaPausada?'La partida se ha pausado.':'La partida se ha reanudado.');
-      await commitGame(before,g,latest=>latest.estado==='jugando');
+      await db.ref(`salas/${currentCode}/juego`).set(cleanFirebaseValue(g));
     }catch(e){fail('No se pudo pausar/reanudar la partida',e);}
   }
-  function readSavedResult(code) {
-    try { const raw=localStorage.getItem(`nexus.resultado.${code}`); return raw?JSON.parse(raw):null; }
-    catch(e){return null;}
-  }
-  function saveResult(result) {
-    try {
-      localStorage.setItem(`nexus.resultado.${result.code}`,JSON.stringify(result));
-      localStorage.setItem('nexus.ultimoResultado',JSON.stringify(result));
-    }catch(e){console.warn('No se pudo guardar el resultado local',e);}
-  }
-  function buildResult(game) {
-    const ranking=Object.values(room.jugadores||{}).map(p=>({name:p.nombre||'Jugador',points:Number(game.puntos?.[p.uid]||0),uid:p.uid})).sort((a,b)=>b.points-a.points);
-    return {code:room.codigo,number:Number(room.numeroPartida||1),finishedAt:Number(game.finalizadaEn||serverNow()),ranking};
-  }
-  function fillRanking(result) {
-    const ranking=result.ranking||[];
-    const max=ranking[0]?.points||0,winners=ranking.filter(p=>p.points===max);
-    $('texto-ganador').textContent=winners.length===1?`Ganador: ${winners[0].name} · ${max} puntos`:`Empate en cabeza: ${winners.map(p=>p.name).join(', ')} · ${max} puntos`;
-    const list=$('ranking-final');list.replaceChildren();
-    ranking.forEach((p,i)=>{const li=document.createElement('li');li.textContent=`${p.name} — ${p.points} puntos`;if(p.points===max)li.classList.add('rank-winner');list.appendChild(li);});
-  }
-  function renderSavedResult(result){
-    if(!result)return;
-    showScreen('pantalla-juego');fillRanking(result);
-    $('acciones-finales').replaceChildren();
-    const exit=document.createElement('button');exit.className='primary full';exit.textContent='Volver al inicio';
-    exit.onclick=()=>leaveRoom();$('acciones-finales').appendChild(exit);
-    $('evento-visual')?.classList.add('hidden');$('pantalla-final').classList.remove('hidden');
-  }
-  function updateRematchClock() {
-    if(!room||room.juego?.estado!=='finalizada')return;
-    const label=$('acciones-finales')?.querySelector('.rematch-status');
-    if(!label)return;
-    const deadline=Core.rematchDeadline(room),remaining=Math.max(0,Number(deadline||0)-serverNow());
-    const count=Object.values(room.solicitudesRevancha||{}).filter(x=>x?.solicitada).length;
-    label.textContent=remaining>0?`Revancha disponible durante ${formatClock(remaining)}. ${count} jugador(es) la han solicitado.`:'El plazo de revancha ha terminado.';
-    $('acciones-finales')?.querySelectorAll('[data-rematch-action]').forEach(button=>{if(!remaining)button.disabled=true;});
-  }
   function renderFinalRanking(game) {
-    const modal=$('pantalla-final');if(!modal)return;
-    if(game.estado!=='finalizada'){modal.classList.add('hidden');return;}
-    const result=buildResult(game);saveResult(result);$('btn-ultimo-resultado')?.classList.remove('hidden');fillRanking(result);
-    const actions=$('acciones-finales');actions.replaceChildren();
-    const deadline=Core.rematchDeadline(room),remain=Math.max(0,Number(deadline||0)-serverNow());
-    const status=document.createElement('p');status.className='rematch-status';
-    const requests=Object.entries(room.solicitudesRevancha||{}).filter(([,r])=>r?.solicitada).map(([uid])=>uid);
-    const requested=requests.includes(user?.uid);
-    status.textContent=remain>0?`Revancha disponible durante ${formatClock(remain)}. ${requests.length} jugador(es) la han solicitado.`:'El plazo de revancha ha terminado.';
-    actions.appendChild(status);
-    if(remain>0 && room.jugadores?.[user?.uid]) {
-      const replay=document.createElement('button');replay.className='primary full';
-      replay.textContent=requested?'Revancha solicitada':'Volver a jugar';replay.disabled=requested;replay.dataset.rematchAction='request';
-      replay.onclick=()=>requestRematch();actions.appendChild(replay);
-      if(room.creadorUid===user.uid && requested && requests.length>=2) {
-        const accept=document.createElement('button');accept.className='primary full';accept.textContent='Iniciar revancha con quienes han aceptado';accept.dataset.rematchAction='start';
-        accept.onclick=()=>acceptRematch();actions.appendChild(accept);
-      }
+    const modal=$('pantalla-final');if(!modal||game.estado!=='finalizada')return;
+    const ranking=Object.values(room.jugadores||{}).map(p=>({name:p.nombre||'Jugador',points:Number(game.puntos?.[p.uid]||0),uid:p.uid})).sort((a,b)=>b.points-a.points);
+    const max=ranking[0]?.points||0, winners=ranking.filter(p=>p.points===max);
+    $('texto-ganador').textContent=winners.length===1?`Ganador: ${winners[0].name} · ${winners[0].points} puntos`:`Empate en cabeza: ${winners.map(p=>p.name).join(', ')} · ${max} puntos`;
+    const list=$('ranking-final');list.replaceChildren();ranking.forEach((p,i)=>{const li=document.createElement('li');li.textContent=`${i+1}. ${p.name} — ${p.points} puntos`;if(p.points===max)li.classList.add('rank-winner');list.appendChild(li);});
+    const actions=$('acciones-finales');
+    if(actions){
+      actions.replaceChildren();
+      const replay=document.createElement('button');replay.className='primary full';replay.textContent='Volver a jugar';
+      replay.onclick=()=>leaveRoom();actions.appendChild(replay);
+      const exit=document.createElement('button');exit.className='secondary full';exit.textContent='Salir';
+      exit.onclick=()=>leaveRoom();actions.appendChild(exit);
     }
-    const exit=document.createElement('button');exit.className='secondary full';exit.textContent='Salir';
-    exit.onclick=()=>leaveRoom();actions.appendChild(exit);
-    $('evento-visual')?.classList.add('hidden');modal.classList.remove('hidden');
+    // La clasificación debe quedar por encima de cualquier aviso de carta.
+    $('evento-visual')?.classList.add('hidden');
+    modal.classList.remove('hidden');
   }
-  async function requestRematch() {
-    try {
+  async function requestRematch(){
+    try{
       if(!currentCode||!user)throw new Error('No se ha encontrado la sala.');
-      const ref=db.ref(`salas/${currentCode}`),data=(await ref.once('value')).val();
-      if(!data||!Core.rematchOpen(data,serverNow()))throw new Error('El plazo para solicitar revancha ha terminado.');
-      if(!data.jugadores?.[user.uid])throw new Error('No perteneces a esta partida.');
-      const own=ref.child(`solicitudesRevancha/${user.uid}`);
-      const claim=await own.transaction(old=>old||{solicitada:true,nombre:data.jugadores[user.uid].nombre,timestamp:firebase.database.ServerValue.TIMESTAMP},undefined,false);
-      if(!claim.committed && !claim.snapshot.exists())throw new Error('No se registró la solicitud.');
-      // La primera petición fija el plazo adicional: pulsar de nuevo no lo prorroga.
-      const first=ref.child('primeraSolicitudRevanchaEn');
-      await first.transaction(value=>value===null?firebase.database.ServerValue.TIMESTAMP:undefined,undefined,false);
-      const firstAt=Number((await first.once('value')).val()||serverNow());
-      await db.ref(`salasFinalizadas/${currentCode}`).update({
-        creadaEn:data.creadaEn,finalizadaEn:data.juego.finalizadaEn,
-        creadorUid:data.creadorUid,primeraSolicitudEn:firstAt,
-        numeroPartida:Number(data.numeroPartida||1)
-      }).catch(e=>console.warn('No se actualizó el índice de revanchas',e));
-      say('Revancha solicitada. Los demás jugadores disponen de 10 minutos desde la primera solicitud.');
-    }catch(e){fail('No se pudo solicitar revancha',e);}
+      const ref=db.ref(`salas/${currentCode}`),snap=await ref.once('value'),data=snap.val();
+      if(!data||data.juego?.estado!=='finalizada')throw new Error('La partida ya no está en la pantalla final.');
+      if(!data.jugadores?.[user.uid]||data.jugadores[user.uid].conectado===false)throw new Error('Tu jugador ya no está activo en esta sala.');
+      await ref.child(`solicitudesRevancha/${user.uid}`).set({solicitada:true,nombre:data.jugadores[user.uid].nombre||'Jugador',timestamp:firebase.database.ServerValue.TIMESTAMP});
+      say('Solicitud enviada. El anfitrión debe aceptar para comenzar otra partida.');
+    }catch(e){fail('No se pudo solicitar otra partida',e);}
   }
-  async function acceptRematch() {
-    try {
+  async function acceptRematch(){
+    try{
       if(!currentCode||!user)throw new Error('No se ha encontrado la sala.');
       const ref=db.ref(`salas/${currentCode}`);
       let rejection='';
       const result=await ref.transaction(data=>{
         rejection='';
         if(!data){rejection='La sala ya no existe.';return;}
-        if(data.creadorUid!==user.uid){rejection='Solo el anfitrión puede iniciar otra partida.';return;}
-        if(!data.solicitudesRevancha?.[user.uid]?.solicitada){rejection='El anfitrión también debe pulsar Volver a jugar.';return;}
-        if(!Core.rematchOpen(data,serverNow())){rejection='El plazo de revancha ha terminado.';return;}
-        const participants=Object.entries(data.jugadores||{})
-          .filter(([uid,p])=>p?.conectado===true && data.solicitudesRevancha?.[uid]?.solicitada===true)
+        if(data.creadorUid!==user.uid){rejection='Solo el creador de la sala puede aceptar y comenzar otra partida.';return;}
+        if(data.juego?.estado!=='finalizada'){rejection='La partida no ha terminado.';return;}
+        const requests=Object.values(data.solicitudesRevancha||{}).filter(r=>r?.solicitada===true);
+        if(!requests.length){rejection='Ningún jugador ha solicitado volver a jugar.';return;}
+        const players=Object.entries(data.jugadores||{})
+          .filter(([uid,p])=>p?.conectado===true && p?.uid===uid)
           .map(([uid,p])=>({...p,uid}));
-        if(participants.length<2){rejection='Se necesitan dos jugadores conectados que hayan solicitado revancha.';return;}
-        const deck=Core.shuffle(makeDeck(participants.length)),burned=deck.pop(),hands={},scores={};
-        participants.forEach(player=>{hands[player.uid]=[deck.pop()];scores[player.uid]=0;});
-        const first=participants[Core.integerBelow(participants.length)];
-        const game={ronda:1,mazo:deck,manos:hands,puntos:scores,turnoUid:first.uid,cartaRobada:false,cartaJugada:false,jugadas:[],historial:[],eliminados:{},cartaQuemada:burned,temporizadorActivo:!!data.temporizadorActivo,tiempoRestanteMs:120000,turnoStartedAt:serverNow(),partidaPausada:false,estado:'jugando',version:0};
-        addHistoryEntry(game,`Nueva partida. Empieza ${first.nombre}.`);
-        data.jugadores=Object.fromEntries(participants.map(player=>[player.uid,player]));
-        data.estado='jugando';data.numeroPartida=Number(data.numeroPartida||1)+1;data.juego=game;
-        data.solicitudesRevancha=null;data.primeraSolicitudRevanchaEn=null;
+        if(players.length<2){rejection='Se necesitan al menos dos jugadores conectados para comenzar otra partida.';return;}
+        const deck=makeDeck(players.length).sort(()=>Math.random()-.5);
+        const cartaQuemada=deck.pop(),hands={},scores={};
+        players.forEach(p=>{hands[p.uid]=[deck.pop()];scores[p.uid]=0;});
+        const first=players[Math.floor(Math.random()*players.length)];
+        const game={ronda:1,mazo:deck,manos:hands,puntos:scores,turnoUid:first.uid,cartaRobada:false,cartaJugada:false,jugadas:[],historial:[],eliminados:{},cartaQuemada,temporizadorActivo:!!data.temporizadorActivo,tiempoRestanteMs:120000,turnoStartedAt:Date.now(),partidaPausada:false,estado:'jugando'};
+        addHistoryEntry(game,`Nueva partida aceptada por el anfitrión. Participan ${players.map(p=>p.nombre||'Jugador').join(', ')}. Empieza ${first.nombre||'el primer jugador'}.`);
+        // Los jugadores desconectados se excluyen de la nueva partida y de la sala.
+        data.jugadores=Object.fromEntries(players.map(p=>[p.uid,p]));
+        data.estado='jugando';data.numeroPartida=Number(data.numeroPartida||1)+1;data.juego=game;data.solicitudesRevancha={};
         return cleanFirebaseValue(data);
       },undefined,false);
-      if(!result.committed)throw new Error(rejection||'La sala ha cambiado. Vuelve a intentarlo.');
-      await db.ref(`salasFinalizadas/${currentCode}`).remove().catch(()=>{});
-      $('pantalla-final')?.classList.add('hidden');say('La revancha ha comenzado con los jugadores que la solicitaron.');
+      if(!result.committed)throw new Error(rejection||'La sala ha cambiado. Actualiza e inténtalo de nuevo.');
+      say('Nueva partida iniciada con los jugadores que siguen conectados.');
     }catch(e){fail('No se pudo iniciar la revancha',e);}
   }
   function renderReentryControls() {
@@ -531,41 +418,29 @@
   }
   async function resolveReentry(requesterUid, accept) {
     try {
-      const ref=db.ref(`salas/${currentCode}`);let reason='';
-      const result=await ref.transaction(data=>{
-        reason='';
-        if(!data||data.creadorUid!==user?.uid){reason='Solo el anfitrión puede resolver reingresos.';return;}
-        const request=data.solicitudesReingreso?.[requesterUid];
-        if(!request||request.estado!=='pendiente'){reason='La solicitud ya no está pendiente.';return;}
-        const oldUid=request.objetivoUid,newUid=request.solicitanteUid;
-        if(accept){
-          if(oldUid!==newUid){
-            const old=data.jugadores?.[oldUid];if(!old){reason='No se encuentra el jugador original.';return;}
-            data.jugadores[newUid]={...old,uid:newUid,nombre:request.nombre,conectado:true,reingresoBloqueado:false};
-            delete data.jugadores[oldUid];
-            if(data.juego)migratePlayerState(data.juego,oldUid,newUid);
-          }else if(data.jugadores?.[oldUid]){data.jugadores[oldUid].conectado=true;delete data.jugadores[oldUid].salioEn;}
-          request.estado='aceptada';
-          if(data.juego)addHistoryEntry(data.juego,`${request.nombre} ha vuelto a entrar en la partida.`,'effect');
-        } else {
-          if(data.jugadores?.[oldUid]){
-            data.jugadores[oldUid].reingresoBloqueado=true;data.jugadores[oldUid].conectado=false;
-            if(data.juego?.manos)data.juego.manos[oldUid]=[];
-          }
-          const g=data.juego;
-          if(g&&g.turnoUid===oldUid){
-            const alive=Object.values(data.jugadores||{}).filter(p=>p.uid!==oldUid&&(g.manos?.[p.uid]||[]).length);
-            if(alive.length){g.turnoUid=alive[0].uid;g.cartaRobada=false;g.cartaJugada=false;
-              if(g.temporizadorActivo){g.tiempoRestanteMs=120000;g.turnoStartedAt=serverNow();}}
-          }
-          if(g)addHistoryEntry(g,`${request.nombre} ha sido eliminado por el anfitrión.`,'warning');
-          request.estado='rechazada';
+      const ref=db.ref(`salas/${currentCode}`),snap=await ref.once('value'),data=snap.val();
+      if(!data||data.creadorUid!==user?.uid)throw new Error('Solo el anfitrión puede resolver solicitudes.');
+      const request=data.solicitudesReingreso?.[requesterUid];if(!request||request.estado!=='pendiente')return;
+      const oldUid=request.objetivoUid,newUid=request.solicitanteUid;
+      if(accept){
+        if(oldUid!==newUid){const oldPlayer=data.jugadores?.[oldUid];if(!oldPlayer)throw new Error('No se encuentra el jugador que solicita volver.');
+          data.jugadores[newUid]={...oldPlayer,uid:newUid,nombre:request.nombre,conectado:true,reingresoBloqueado:false};delete data.jugadores[oldUid];
+          if(data.creadorUid===oldUid)data.creadorUid=newUid;
+          if(data.juego)migratePlayerState(data.juego,oldUid,newUid);
+        }else if(data.jugadores?.[oldUid]){data.jugadores[oldUid].conectado=true;delete data.jugadores[oldUid].salioEn;}
+        request.estado='aceptada';request.resueltaEn=Date.now();
+        addHistoryEntry(data.juego,`${request.nombre} ha vuelto a entrar en la partida.`,'effect');
+      }else{
+        if(data.jugadores?.[oldUid]){data.jugadores[oldUid].reingresoBloqueado=true;data.jugadores[oldUid].conectado=false;if(data.juego&&data.juego.manos)data.juego.manos[oldUid]=[];}
+        const g=data.juego;
+        if(g&&g.turnoUid===oldUid){
+          const survivors=Object.values(data.jugadores||{}).filter(p=>p.uid!==oldUid&&(g.manos?.[p.uid]||[]).length>0);
+          if(survivors.length){g.turnoUid=survivors[0].uid;g.cartaRobada=false;g.cartaJugada=false;if(g.temporizadorActivo){g.tiempoRestanteMs=120000;g.turnoStartedAt=Date.now();}}
         }
-        request.resueltaEn=serverNow();
-        if(data.juego)data.juego.version=Number(data.juego.version||0)+1;
-        return cleanFirebaseValue(data);
-      },undefined,false);
-      if(!result.committed)throw new Error(reason||'El estado de la sala ha cambiado.');
+        if(g)addHistoryEntry(g,`${request.nombre} ha sido eliminado de la partida por el anfitrión.`,'warning');
+        request.estado='rechazada';request.resueltaEn=Date.now();
+      }
+      await ref.set(data);
     }catch(e){fail('No se pudo resolver el reingreso',e);}
   }
   async function toggleReentry() {
@@ -595,11 +470,9 @@
   }
   function renderRoundCardCounter(game) {
     const root=$('contador-cartas-ronda');if(!root)return;root.replaceChildren();
-    root.classList.toggle('two-player',playersOf().length===2);
-    const counts={};Core.cardsForPlayers(playersOf().length).forEach(id=>{const value=Number(id[0]);counts[value]=(counts[value]||0)+1;});
+    const counts={};Object.keys(CARD_META).forEach(id=>{const value=Number(id[0]);counts[value]=(counts[value]||0)+1;});
     const played={};(game.jugadas||[]).filter(x=>x.esJugada===true).forEach(x=>{const value=Number(x.carta?.value??String(x.carta?.id||'')[0]);if(Number.isFinite(value))played[value]=(played[value]||0)+1;});
     for(let value=0;value<=9;value++){
-      if(!counts[value])continue; // No mostrar valores que no existen en el mazo de dos jugadores.
       const item=document.createElement('div');item.className='round-counter-item';
       const label=document.createElement('strong');label.textContent=String(value);item.appendChild(label);
       const count=document.createElement('span');count.textContent=`${played[value]||0}/${counts[value]||0}`;item.appendChild(count);root.appendChild(item);
@@ -614,7 +487,7 @@
     const turnLabel=$('indicador-turno');if(turnLabel)turnLabel.textContent=game.estado==='finalizada'?'Partida finalizada':(game.turnoUid===user?.uid?'TU TURNO':`Turno de ${currentPlayer?.nombre||'otro jugador'}`);
     $('numero-ronda').textContent=game.ronda||1;
     $('cartas-restantes').textContent=(game.mazo||[]).length;
-    $('objetivo-puntos').textContent=game.objetivoPuntos||room.puntosObjetivo||5;
+    $('objetivo-puntos').textContent=room.puntosObjetivo||5;
     renderRoundCardCounter(game);
     const zone=$('zona-jugadores');zone.replaceChildren();
     playersOf().forEach(p=>{
@@ -662,117 +535,115 @@
     root.classList.remove('hidden');root.classList.add('event-pop');clearTimeout(visualTimer);
   }
   async function createRoom() {
-    if(busy)return;busy=true;say('');$('btn-generar-partida').disabled=true;
-    let reserved=null;
+    if(busy)return; busy=true; say(""); $("btn-generar-partida").disabled=true;
     try {
-      const name=Core.safeName($('nombre-creador').value);
-      const max=Number($('numero-jugadores').value),target=Number($('puntos-objetivo').value);
-      if(!Number.isInteger(max)||max<2||max>8)throw new Error('Elige entre 2 y 8 jugadores.');
-      if(!Number.isInteger(target)||target<1||target>20)throw new Error('El objetivo debe estar entre 1 y 20 puntos.');
-      await ensureUser();await creationCooldown();
+      const name=$("nombre-creador").value.trim(); validateName(name);
+      const max=Number($("numero-jugadores").value), target=Number($("puntos-objetivo").value);
+      if(!Number.isInteger(max)||max<2||max>8) throw new Error("Elige entre 2 y 8 jugadores.");
+      if(!Number.isInteger(target)||target<1||target>20) throw new Error("El objetivo debe estar entre 1 y 20 puntos.");
+      await ensureUser();
       let code=null;
-      for(let i=0;i<10&&!code;i++) {
-        const candidate=randomCode(),ref=db.ref(`salas/${candidate}`);
-        await reserveCreationSlot(candidate);reserved=candidate;
-        const data={codigo:candidate,creadorUid:user.uid,versionCreacion:'1.02',numeroPartida:1,maxJugadores:max,puntosObjetivo:target,temporizadorActivo:$('temporizador-activo')?.value==='si',reingresoAbierto:true,estado:'esperando',creadaEn:firebase.database.ServerValue.TIMESTAMP,jugadores:{[user.uid]:{uid:user.uid,nombre:name,conectado:true,unidoEn:firebase.database.ServerValue.TIMESTAMP}}};
-        const claim=await ref.transaction(previous=>previous===null?data:undefined,undefined,false);
-        if(claim.committed){code=candidate;break;}
-        await db.ref(`usuarioSalas/${user.uid}/${candidate}`).remove();reserved=null;
+      for(let i=0;i<10&&!code;i++){
+        const candidate=randomCode(), ref=db.ref(`salas/${candidate}`);
+        const snap=await ref.once("value");
+        if(snap.exists()) continue;
+        const data={codigo:candidate,creadorUid:user.uid,versionCreacion:'1.32',numeroPartida:1,maxJugadores:max,puntosObjetivo:target,temporizadorActivo:$("temporizador-activo")?.value==="si",reingresoAbierto:true,estado:"esperando",creadaEn:firebase.database.ServerValue.TIMESTAMP,jugadores:{[user.uid]:{uid:user.uid,nombre:name,conectado:true,unidoEn:firebase.database.ServerValue.TIMESTAMP}}};
+        // El código es aleatorio; set crea el nodo. En colisión extremadamente improbable se comprueba antes.
+        await ref.set(data); code=candidate;
       }
-      if(!code)throw new Error('No se pudo crear un código único.');
-      await registerCreatedRoomOnce(code);
-      listen(code);say('');
-    }catch(e){
-      if(reserved){const exists=await db.ref(`salas/${reserved}`).once('value').then(s=>s.exists()).catch(()=>true);if(!exists)await db.ref(`usuarioSalas/${user.uid}/${reserved}`).remove().catch(()=>{});}
-      fail('Error al crear la sala',e);
-    }finally{busy=false;$('btn-generar-partida').disabled=false;}
+      if(!code) throw new Error("No se pudo generar un código único. Vuelve a intentarlo.");
+      try{await registerCreatedRoomOnce(code);}catch(statsError){console.warn('No se pudo actualizar el contador de partidas creadas. Revisa las reglas de Firebase.',statsError);}
+      listen(code); say("");
+    } catch(e){fail("Error al crear la sala",e);}
+    finally{busy=false;$("btn-generar-partida").disabled=false;}
   }
   async function joinRoom() {
-    if(busy)return;busy=true;say('');$('btn-unirse').disabled=true;
-    const code=$('codigo-partida').value.trim().toUpperCase();
+    if(busy)return; busy=true; say(""); $("btn-unirse").disabled=true;
+    const name=$("nombre-jugador").value.trim(), code=$("codigo-partida").value.trim().toUpperCase();
     try {
-      const name=Core.safeName($('nombre-jugador').value);
-      if(!/^[A-HJ-NP-Z2-9]{6}$/.test(code))throw new Error('El código debe tener 6 caracteres válidos.');
+      validateName(name);
+      if(!/^[A-HJ-NP-Z2-9]{6}$/.test(code)) throw new Error("El código debe tener 6 caracteres válidos.");
       await ensureUser();
       const ref=db.ref(`salas/${code}`);
-      let data;
-      try { data=(await ref.once('value')).val(); }
-      catch(e) {
-        if(e.code!=='PERMISSION_DENIED'&&e.code!=='permission_denied')throw e;
-        // Para reingresar se consulta solo la ficha pública, NO las manos ni el mazo.
-        const paths=['estado','creadaEn','creadorUid','maxJugadores','reingresoAbierto','jugadores'];
-        const values=await Promise.all(paths.map(path=>ref.child(path).once('value').then(s=>s.val())));
-        data=Object.fromEntries(paths.map((path,i)=>[path,values[i]]));
-        if(!data.estado)throw new Error('No existe la sala o no tienes acceso.');
-      }
-      if(!data)throw new Error('No existe una sala con ese código.');
-      if(Core.expired(data.creadaEn,serverNow())){await deleteRoomIfEligible(code,data);throw new Error('La sala ha caducado a las 48 horas.');}
+      console.info("[UNIRSE] Leyendo sala:",ref.toString());
+      const snap=await ref.once("value");
+      const data=snap.val();
+      console.info("[UNIRSE] Resultado de lectura:",{exists:snap.exists(),estado:data?.estado,jugadores:Object.keys(data?.jugadores||{}).length});
+      if(!data) throw new Error("No existe una sala con ese código. Comprueba que el código es correcto.");
+      if(await expireRoomIfNeeded(code,data)) throw new Error("La sala ha caducado: han pasado 48 horas desde su creación.");
       const existing=data.jugadores||{};
-      if(data.estado==='jugando') {
-        if(data.juego?.estado==='finalizada'&&!Core.rematchOpen(data,serverNow()))throw new Error('La sala ya ha terminado.');
-        const same=existing[user.uid];
-        if(same){await ref.child(`jugadores/${user.uid}`).update({conectado:true,salioEn:null});listen(code);return;}
-        if(data.juego?.estado==='finalizada')throw new Error('Solo los participantes de la partida pueden solicitar revancha.');
-        if(!data.reingresoAbierto)throw new Error('El anfitrión ha cerrado los reingresos.');
-        const normalized=name.toLocaleLowerCase('es');
+      if(data.estado==="jugando") {
+        if(!data.reingresoAbierto) throw new Error("El anfitrión ha cerrado los reingresos a esta partida.");
+        const normalized=name.trim().toLocaleLowerCase('es');
         const previous=Object.values(existing).find(p=>(p.nombre||'').trim().toLocaleLowerCase('es')===normalized);
-        if(!previous)throw new Error('Para reingresar utiliza el mismo nombre de la partida.');
-        if(previous.reingresoBloqueado)throw new Error('El anfitrión ha bloqueado este jugador.');
-        if(previous.conectado)throw new Error('Ese jugador continúa conectado.');
-        if(previous.uid===data.creadorUid)throw new Error('El anfitrión debe recuperar su sesión original en el mismo navegador; no se permite apropiarse de ella por nombre.');
+        if(!previous) throw new Error("Para volver a entrar debes usar exactamente el mismo nombre que tenías en la partida.");
+        if(previous.reingresoBloqueado) throw new Error("El anfitrión ha eliminado tu acceso a esta partida.");
+        if(previous.conectado && previous.uid!==user.uid) throw new Error("Ya hay un jugador conectado con ese nombre.");
+        // El anfitrión no puede aprobarse a sí mismo: si vuelve con una sesión nueva, se restaura su identidad directamente.
+        if(previous.uid===data.creadorUid && previous.uid!==user.uid && !previous.conectado) {
+          data.jugadores[user.uid]={...previous,uid:user.uid,nombre:name,conectado:true,reingresoBloqueado:false};delete data.jugadores[previous.uid];data.creadorUid=user.uid;
+          if(data.juego)migratePlayerState(data.juego,previous.uid,user.uid);
+          await ref.set(data);listen(code);say('Has recuperado tu sesión de anfitrión.');return;
+        }
+        if(previous.uid===user.uid && previous.uid===data.creadorUid) { await ref.child(`jugadores/${user.uid}`).update({conectado:true,salioEn:null});listen(code);return; }
         await ref.child(`solicitudesReingreso/${user.uid}`).set({solicitanteUid:user.uid,objetivoUid:previous.uid,nombre:name,estado:'pendiente',solicitadaEn:firebase.database.ServerValue.TIMESTAMP});
         const reqRef=ref.child(`solicitudesReingreso/${user.uid}`);
-        const onAnswer=async answer=>{
-          const val=answer.val();if(!val)return;
-          if(val.estado==='aceptada'){reqRef.off('value',onAnswer);await reqRef.remove().catch(()=>{});listen(code);say('El anfitrión ha aceptado tu reingreso.');}
-          if(val.estado==='rechazada'){reqRef.off('value',onAnswer);say('El anfitrión ha rechazado tu reingreso.');}
+        const requestCallback=async reqSnap=>{
+          const req=reqSnap.val();
+          if(!req)return;
+          if(req.estado==='aceptada') {reqRef.off('value',requestCallback);await reqRef.remove().catch(()=>{});listen(code);say('El anfitrión ha aceptado tu reingreso.');}
+          else if(req.estado==='rechazada') {reqRef.off('value',requestCallback);say('El anfitrión ha rechazado tu reingreso.');}
         };
-        reqRef.on('value',onAnswer);say('Solicitud enviada al anfitrión.');return;
+        reqRef.on('value',requestCallback);
+        say('Solicitud enviada al anfitrión. Espera a que acepte tu reingreso.');
+        return;
       }
-      if(data.estado!=='esperando')throw new Error('La sala ya no está disponible.');
-      if(!existing[user.uid] && Object.keys(existing).length>=Number(data.maxJugadores))throw new Error('La sala está completa.');
-      if(!existing[user.uid])await ref.child(`jugadores/${user.uid}`).set({uid:user.uid,nombre:name,conectado:true,unidoEn:firebase.database.ServerValue.TIMESTAMP});
-      else await ref.child(`jugadores/${user.uid}/conectado`).set(true);
+      if(data.estado!=="esperando") throw new Error("La sala ya no está disponible.");
+      if(!existing[user.uid] && Object.keys(existing).length>=Number(data.maxJugadores)) throw new Error("La sala está completa.");
+      if(!existing[user.uid]) {
+        const playerRef=ref.child(`jugadores/${user.uid}`);
+        await playerRef.set({uid:user.uid,nombre:name,conectado:true,unidoEn:firebase.database.ServerValue.TIMESTAMP});
+      } else await ref.child(`jugadores/${user.uid}/conectado`).set(true);
       listen(code);
-    }catch(e){fail('Error al unirse a la sala',e);}
-    finally{busy=false;$('btn-unirse').disabled=false;}
+    } catch(e){fail("Error al unirse a la sala",e);}
+    finally{busy=false;$("btn-unirse").disabled=false;}
   }
   async function startGame() {
-    say('');
+    say("");
     try {
       await ensureUser();
-      if(!currentCode)throw new Error('No se ha encontrado la sala.');
-      const ref=db.ref(`salas/${currentCode}`);let problem='';
-      const result=await ref.transaction(data=>{
-        problem='';
-        if(!data||data.creadorUid!==user.uid){problem='Solo el anfitrión puede comenzar.';return;}
-        if(data.estado!=='esperando'||Core.expired(data.creadaEn,serverNow())){problem='La sala no está disponible.';return;}
-        const players=Object.values(data.jugadores||{});
-        if(players.length<2){problem='Se necesitan dos jugadores.';return;}
-        const deck=Core.shuffle(makeDeck(players.length)),burned=deck.pop(),hands={},scores={};
-        players.forEach(player=>{hands[player.uid]=[deck.pop()];scores[player.uid]=0;});
-        const first=players[Core.integerBelow(players.length)];
-        const game={ronda:1,mazo:deck,manos:hands,puntos:scores,turnoUid:first.uid,cartaRobada:false,cartaJugada:false,jugadas:[],historial:[],eliminados:{},cartaQuemada:burned,temporizadorActivo:!!data.temporizadorActivo,tiempoRestanteMs:120000,turnoStartedAt:serverNow(),partidaPausada:false,estado:'jugando',version:0};
-        addHistoryEntry(game,`La partida ha comenzado. Empieza ${first.nombre||'el primer jugador'}.`);
-        data.estado='jugando';data.juego=game;return cleanFirebaseValue(data);
-      },undefined,false);
-      if(!result.committed)throw new Error(problem||'La partida ya ha comenzado.');
-    }catch(e){fail('No se pudo iniciar la partida',e);}
+      if(!room || room.creadorUid!==user.uid) throw new Error("Solo el anfitrión puede iniciar la partida.");
+      const current=await db.ref(`salas/${currentCode}`).once("value");
+      const data=current.val();
+      if(!data || data.estado!=="esperando") throw new Error("La sala ya no está esperando jugadores.");
+      const players=Object.values(data.jugadores||{});
+      if(players.length<2) throw new Error("Se necesitan al menos 2 jugadores.");
+      const deck=makeDeck(players.length).sort(()=>Math.random()-.5);
+      const cartaQuemada=deck.pop(); // Se quema antes de repartir y se revela al cerrar la ronda.
+      const hands={}; const scores={};
+      players.forEach(p=>{hands[p.uid]=[deck.pop()];scores[p.uid]=0;});
+      const first=players[Math.floor(Math.random()*players.length)];
+      const game={ronda:1,mazo:deck,manos:hands,puntos:scores,turnoUid:first.uid,cartaRobada:false,cartaJugada:false,jugadas:[],historial:[],eliminados:{},cartaQuemada,temporizadorActivo:!!data.temporizadorActivo,tiempoRestanteMs:120000,turnoStartedAt:Date.now(),partidaPausada:false,estado:"jugando"};
+      addHistoryEntry(game,`La partida ha comenzado. Empieza ${(data.jugadores[first.uid]||{}).nombre||"el primer jugador"}.`);
+      await db.ref(`salas/${currentCode}`).update({estado:"jugando",juego:game});
+    } catch(e){fail("No se pudo iniciar la partida",e);}
   }
   async function drawCard() {
     try {
-      const data=(await db.ref(`salas/${currentCode}`).once('value')).val(),g=data?.juego;
-      if(!g||g.estado!=='jugando'||g.turnoUid!==user?.uid)throw new Error('No es tu turno.');
-      if(Core.expired(data.creadaEn,serverNow()))throw new Error('La sala ha caducado.');
-      if(g.partidaPausada)throw new Error('La partida está pausada.');
-      const before=structuredClone(g);normalizeGameForAction(g,user.uid);
-      if(g.cartaRobada||g.cartaJugada)throw new Error('Ya has robado en este turno.');
-      if(!g.mazo.length)throw new Error('No quedan cartas en el mazo.');
-      if(!g.manos[user.uid].length)throw new Error('Has sido eliminado de esta ronda.');
-      const card=g.mazo.pop();g.manos[user.uid].push(card);g.cartaRobada=true;
-      addHistoryEntry(g,`${data.jugadores?.[user.uid]?.nombre||'Un jugador'} roba una carta.`);
-      await commitGame(before,g,latest=>latest.turnoUid===user.uid&&!latest.cartaRobada&&!latest.cartaJugada&&latest.estado==='jugando');
-    }catch(e){fail('No se pudo robar carta',e);}
+      const snap=await db.ref(`salas/${currentCode}`).once("value"), data=snap.val(), g=data?.juego;
+      if(!g||g.turnoUid!==user.uid) throw new Error("No es tu turno."); if(g.partidaPausada)throw new Error("La partida está pausada.");
+      normalizeGameForAction(g,user.uid);
+      if(g.cartaRobada||g.cartaJugada) throw new Error("Ya has robado una carta en este turno.");
+      if(!g.mazo.length) throw new Error("No quedan cartas en el mazo.");
+      // Una mano vacía significa que el jugador está eliminado de la ronda.
+      // No se le debe repartir una carta automáticamente, porque eso lo resucitaría.
+      if(g.manos[user.uid].length===0) throw new Error("Estás eliminado de esta ronda y no puedes robar cartas.");
+      const card=g.mazo.pop();
+      if(!card) throw new Error("No se ha podido robar una carta del mazo.");
+      g.manos[user.uid].push(card); g.cartaRobada=true;
+      addHistoryEntry(g,`${(data.jugadores[user.uid]||{}).nombre||"Un jugador"} roba una carta.`);
+      await db.ref(`salas/${currentCode}/juego`).set(cleanFirebaseValue(g));
+    } catch(e){fail("No se pudo robar carta",e);}
   }
   function eligibleTargets(g, data, actorUid, allowProtected=false, excludedUids=[]) {
     const excluded=new Set(excludedUids||[]);
@@ -951,7 +822,7 @@
       else {addPlayed(target.uid,held,`${target.nombre} descarta ${held.name} por el efecto de ${actorName}.`);entry.cartaDescartada=held;if(Number(held.value)===8){g.manos[target.uid]=[];entry.resultado=`${target.nombre} descarta a Lyanna (8) y queda eliminado.`;}else{const replacement=(g.mazo||[]).pop();g.manos[target.uid]=replacement?[replacement]:[];entry.resultado=replacement?`${target.nombre} descarta ${held.name} y roba una carta de reemplazo.`:`${target.nombre} descarta ${held.name}, pero no quedan cartas para robar; queda eliminado.`;}announce(g,'carta',entry.resultado,{carta:held});}addHistoryEntry(g,entry.resultado,'effect');return;
     }
     if(id==='62'){
-      const alive=Object.keys(data.jugadores||{}).filter(uid=>(g.manos?.[uid]||[]).length>0);const pool=Core.shuffle(alive.map(uid=>g.manos[uid][0]));alive.forEach((uid,i)=>g.manos[uid]=[pool[i]]);entry.resultado=`${actorName} jugó al Malikor: las cartas de los jugadores vivos se repartieron de nuevo al azar.`;addHistoryEntry(g,entry.resultado,'effect');announce(g,'carta',entry.resultado,{carta:card});return;
+      const alive=Object.keys(data.jugadores||{}).filter(uid=>(g.manos?.[uid]||[]).length>0);const pool=alive.map(uid=>g.manos[uid][0]).sort(()=>Math.random()-.5);alive.forEach((uid,i)=>g.manos[uid]=[pool[i]]);entry.resultado=`${actorName} jugó al Malikor: las cartas de los jugadores vivos se repartieron de nuevo al azar.`;addHistoryEntry(g,entry.resultado,'effect');announce(g,'carta',entry.resultado,{carta:card});return;
     }
     if(id==='61'){
       const target=await chooseTarget(g,data,actorUid,'Valerius: elige a un jugador para intercambiar las cartas.',false,entry);if(!target){entry.cancelled=true;entry.resultado='No se eligió objetivo. La carta no se ha jugado.';return;}const mine=(g.manos?.[actorUid]||[])[0],theirs=(g.manos?.[target.uid]||[])[0];if(mine&&theirs){g.manos[actorUid]=[theirs];g.manos[target.uid]=[mine];entry.objetivoUid=target.uid;entry.objetivoNombre=target.nombre;entry.resultado=`${actorName} intercambió su carta con ${target.nombre}.`;announce(g,'carta',entry.resultado,{carta:card});}return;
@@ -972,8 +843,8 @@
     playCardBusy=true;
     try {
       const snap=await db.ref(`salas/${currentCode}`).once("value"), data=snap.val(), g=data?.juego;
-      if(!g||g.estado!=='jugando'||g.turnoUid!==user.uid) throw new Error("No es tu turno."); if(g.partidaPausada)throw new Error("La partida está pausada.");
-      const before=structuredClone(g);normalizeGameForAction(g,user.uid);
+      if(!g||g.turnoUid!==user.uid) throw new Error("No es tu turno."); if(g.partidaPausada)throw new Error("La partida está pausada.");
+      normalizeGameForAction(g,user.uid);
       if(!g.cartaRobada) throw new Error("Primero debes robar una carta.");
       if(g.cartaJugada) throw new Error("Ya has jugado una carta en este turno.");
       g.manos=g.manos||{};g.manos[user.uid]=Array.isArray(g.manos[user.uid])?g.manos[user.uid]:[];g.jugadas=Array.isArray(g.jugadas)?g.jugadas:[];g.historial=Array.isArray(g.historial)?g.historial:[];g.protegidos=g.protegidos||{};g.apuestasTheon=g.apuestasTheon||{};
@@ -999,6 +870,7 @@
         g.manos[user.uid]=[...(g.manos[user.uid]||[]),card];
         g.cartaJugada=false;
         addHistoryEntry(g,entry.resultado||'Acción cancelada; la carta vuelve a la mano.','warning');
+        await db.ref(`salas/${currentCode}/juego`).set(cleanFirebaseValue(g));
         selectedCard=null;
         say(entry.resultado||'Acción cancelada. Puedes volver a intentarlo.');
         return;
@@ -1026,7 +898,7 @@
       if(entry.cartaComparadaActor||entry.cartaComparada){delete entry.cartaComparadaActor;delete entry.cartaComparada;}
       g.ultimaResolucionPublica=resolutionEvent;
       g.eventoVisual=resolutionEvent;
-      await commitGame(before,g,latest=>latest.turnoUid===user.uid&&latest.cartaRobada&&!latest.cartaJugada&&latest.estado==='jugando');selectedCard=null;
+      await db.ref(`salas/${currentCode}/juego`).set(cleanFirebaseValue(g));selectedCard=null;
       // El efecto se guarda primero; después se avanza automáticamente al siguiente turno.
       await endTurn(true);
     } catch(e){fail("No se pudo jugar la carta",e);}
@@ -1038,9 +910,8 @@
     const passButton=$("btn-pasar");if(passButton)passButton.disabled=true;
     try {
       const snap=await db.ref(`salas/${currentCode}`).once("value"), data=snap.val(), g=data?.juego;
-      if(!g||g.estado!=='jugando'||g.turnoUid!==user.uid) throw new Error("No es tu turno."); if(g.partidaPausada)throw new Error("La partida está pausada.");
+      if(!g||g.turnoUid!==user.uid) throw new Error("No es tu turno."); if(g.partidaPausada)throw new Error("La partida está pausada.");
       if(!g.cartaJugada) throw new Error("Debes robar y jugar una carta antes de terminar el turno.");
-      const before=structuredClone(g);
       const lastResolution=g.ultimaResolucionPublica||g.eventoVisual||null;
       const players=Object.values(data.jugadores||{}), index=players.findIndex(p=>p.uid===user.uid);
       const aliveNow=players.filter(p=>(g.manos?.[p.uid]||[]).length>0);
@@ -1048,7 +919,7 @@
       const next=candidates[0] || aliveNow[0] || players[(index+1+players.length)%Math.max(players.length,1)];
       if(!next) throw new Error("No hay jugadores disponibles para continuar la partida.");
       addHistoryEntry(g,`${(data.jugadores[user.uid]||{}).nombre||"El jugador"} termina su turno. Ahora juega ${(next||{}).nombre||"el siguiente jugador"}.`);
-      g.turnoUid=next.uid; g.cartaRobada=false; g.cartaJugada=false; if(g.temporizadorActivo){g.tiempoRestanteMs=120000;g.turnoStartedAt=serverNow();}
+      g.turnoUid=next.uid; g.cartaRobada=false; g.cartaJugada=false; if(g.temporizadorActivo){g.tiempoRestanteMs=120000;g.turnoStartedAt=Date.now();}
       // La protección dura hasta que vuelve a empezar el turno de ese jugador.
       if(g.protegidos?.[next.uid]) delete g.protegidos[next.uid];
       // Cada jugador mantiene una carta en la mano. Las cartas jugadas quedan visibles en la mesa.
@@ -1065,33 +936,32 @@
           Object.entries(g.apuestasTheon||{}).forEach(([targetUid,bonusUid])=>{if(targetUid===winner.uid && bonusUid!==winner.uid)g.puntos[bonusUid]=(g.puntos[bonusUid]||0)+1;});
           addHistoryEntry(g,`${winner.nombre} gana la ronda y suma un punto.`,'round');
           g.eventoVisual={...(lastResolution||{}),id:Date.now()+Math.random(),tipo:'ronda',nombre:winner.nombre,cartaQuemada:g.cartaQuemada||null,texto:`${lastResolution?.texto||'Se ha resuelto la última carta jugada.'}\n\nFin de ronda: ${winner.nombre} gana la ronda con una carta de valor ${high}.`,puntuaciones:{...g.puntos}};
-          let objective=Number(g.objetivoPuntos||data.puntosObjetivo||5);
+          let objective=Number(data.puntosObjetivo||5);
           let atObjective=players.filter(p=>Number(g.puntos[p.uid]||0)>=objective);
           if(atObjective.length>1){
             do { objective++; atObjective=players.filter(p=>Number(g.puntos[p.uid]||0)>=objective); } while(atObjective.length>1 && objective<1000);
-            g.objetivoPuntos=objective;
+            data.puntosObjetivo=objective;g.objetivoPuntos=objective;
             addHistoryEntry(g,`Empate en la puntuación objetivo: el objetivo sube a ${objective} puntos para todos los jugadores.`,'round');
             g.eventoVisual.texto+=`\n\nEmpate en la puntuación objetivo. El objetivo aumenta a ${objective} puntos para todos.`;
           }
           if(atObjective.length===1) {
-            const matchWinner=atObjective[0];g.estado='finalizada';g.finalizadaEn=firebase.database.ServerValue.TIMESTAMP;
+            const matchWinner=atObjective[0];g.estado='finalizada';
             g.eventoVisual.texto+=`\n\n¡${matchWinner.nombre} gana la partida! Ha alcanzado ${g.puntos[matchWinner.uid]} puntos (objetivo: ${objective}).`;
           } else {
             g.ronda=(g.ronda||1)+1;
-            const newDeck=Core.shuffle(makeDeck(players.length)), newHands={};
+            const newDeck=makeDeck(players.length).sort(()=>Math.random()-.5), newHands={};
             g.cartaQuemada=newDeck.pop();
             players.forEach(p=>{newHands[p.uid]=[newDeck.pop()];});
-            g.mazo=newDeck;g.manos=newHands;g.cartaRobada=false;g.cartaJugada=false;g.jugadas=[];g.protegidos={};g.apuestasTheon={};g.eliminados={};g.forcedWinnerUid=null;g.bonusFinalUid=null;g.turnoUid=players[Core.integerBelow(players.length)].uid;if(g.temporizadorActivo){g.tiempoRestanteMs=120000;g.turnoStartedAt=serverNow();g.partidaPausada=false;}
+            g.mazo=newDeck;g.manos=newHands;g.cartaRobada=false;g.cartaJugada=false;g.jugadas=[];g.protegidos={};g.apuestasTheon={};g.eliminados={};g.forcedWinnerUid=null;g.bonusFinalUid=null;g.turnoUid=players[Math.floor(Math.random()*players.length)].uid;if(g.temporizadorActivo){g.tiempoRestanteMs=120000;g.turnoStartedAt=Date.now();g.partidaPausada=false;}
           }
         } else {
           addHistoryEntry(g,'La ronda termina en empate; no se asigna punto.','round');
           g.eventoVisual={...(lastResolution||{}),id:Date.now()+Math.random(),tipo:'ronda',cartaQuemada:g.cartaQuemada||null,texto:`${lastResolution?.texto||'Se ha resuelto la última carta jugada.'}\n\nFin de ronda: la ronda termina en empate. Nadie suma puntos.`,puntuaciones:{...(g.puntos||{})}};
-          g.ronda=(g.ronda||1)+1;const newDeck=Core.shuffle(makeDeck(players.length)),newHands={};g.cartaQuemada=newDeck.pop();players.forEach(p=>newHands[p.uid]=[newDeck.pop()]);
-          g.mazo=newDeck;g.manos=newHands;g.cartaRobada=false;g.cartaJugada=false;g.jugadas=[];g.protegidos={};g.apuestasTheon={};g.eliminados={};g.forcedWinnerUid=null;g.bonusFinalUid=null;g.turnoUid=players[Core.integerBelow(players.length)].uid;if(g.temporizadorActivo){g.tiempoRestanteMs=120000;g.turnoStartedAt=serverNow();g.partidaPausada=false;}
+          g.ronda=(g.ronda||1)+1;const newDeck=makeDeck(players.length).sort(()=>Math.random()-.5),newHands={};g.cartaQuemada=newDeck.pop();players.forEach(p=>newHands[p.uid]=[newDeck.pop()]);
+          g.mazo=newDeck;g.manos=newHands;g.cartaRobada=false;g.cartaJugada=false;g.jugadas=[];g.protegidos={};g.apuestasTheon={};g.eliminados={};g.forcedWinnerUid=null;g.bonusFinalUid=null;g.turnoUid=players[Math.floor(Math.random()*players.length)].uid;if(g.temporizadorActivo){g.tiempoRestanteMs=120000;g.turnoStartedAt=Date.now();g.partidaPausada=false;}
         }
       }
-      await commitGame(before,g,latest=>latest.turnoUid===user.uid&&latest.cartaJugada&&latest.estado==='jugando');
-
+      const updates={juego:cleanFirebaseValue(g)};if(data.puntosObjetivo!==undefined)updates.puntosObjetivo=data.puntosObjetivo;await db.ref(`salas/${currentCode}`).update(cleanFirebaseValue(updates));
     } catch(e){fail("No se pudo terminar el turno",e);}
     finally {endTurnBusy=false;if(room?.juego)renderGame();}
   }
@@ -1099,7 +969,6 @@
     // Navegar primero: nunca bloquear el botón por latencia, permisos o desconexión de Firebase.
     const code=currentCode, uid=user?.uid, oldRef=roomRef;
     detach(); currentCode=null; room=null; selectedCard=null;
-    try{localStorage.removeItem('nexus.ultimaSala');}catch(_){}
     clearTimeout(visualTimer); lastVisualEvent=null;
     ['pantalla-final','evento-visual','modal-carta','modal-historial'].forEach(id=>$(id)?.classList.add('hidden'));
     say(''); showScreen('pantalla-inicio');
@@ -1111,13 +980,9 @@
         const ref=db.ref(`salas/${code}`);
         const snap=await ref.once('value'), data=snap.val();
         if(!data?.jugadores?.[uid])return;
-        if(data.estado==='jugando' || data.creadorUid===uid)
-          await ref.child(`jugadores/${uid}`).update({conectado:false,salioEn:firebase.database.ServerValue.TIMESTAMP});
+        if(data.estado==='jugando') await ref.child(`jugadores/${uid}`).update({conectado:false,salioEn:firebase.database.ServerValue.TIMESTAMP});
         else await ref.child(`jugadores/${uid}`).remove();
-        if(data.creadorUid===uid&&data.estado!=='jugando'){
-          await ref.update({estado:'cerrada'});
-          await db.ref(`usuarioSalas/${uid}/${code}`).remove().catch(()=>{});
-        }
+        if(data.creadorUid===uid&&data.estado!=='jugando')await ref.update({estado:'cerrada'});
       }catch(e){console.warn('La salida visual se completó; no se pudo actualizar la sala en Firebase:',e);}
     })();
   }
@@ -1133,10 +998,6 @@
     $("cerrar-como-jugar")?.addEventListener("click",()=>$("modal-como-jugar")?.classList.add("hidden"));
     $("btn-crear-partida").addEventListener("click",()=>{say("");showScreen("pantalla-crear");});
     $("btn-unirse-partida").addEventListener("click",()=>{say("");showScreen("pantalla-unirse");});
-    $('btn-ultimo-resultado')?.addEventListener('click',()=>{
-      try{const data=JSON.parse(localStorage.getItem('nexus.ultimoResultado')||'null');if(data)renderSavedResult(data);}
-      catch(e){say('No se ha podido recuperar el último resultado.');}
-    });
     $("btn-volver-inicio-crear").addEventListener("click",()=>showScreen("pantalla-inicio"));
     $("btn-volver-inicio-unirse").addEventListener("click",()=>showScreen("pantalla-inicio"));
     $("numero-jugadores").addEventListener("change",()=>{$("puntos-objetivo").value=Number($("numero-jugadores").value)<=4?5:3;});
@@ -1158,25 +1019,22 @@
       if(!window.firebase || !config) throw new Error("No se han cargado los scripts o la configuración de Firebase.");
       if(!firebase.apps.length) firebase.initializeApp(config);
       auth=firebase.auth(); db=firebase.database();
-      db.ref('.info/serverTimeOffset').on('value',snap=>{serverOffset=Number(snap.val()||0);});
       auth.onAuthStateChanged(u=>{
         user=u||null;
+        if(statsRef&&statsCallback)statsRef.off('value',statsCallback);
+        statsRef=null;statsCallback=null;
         if(u){
-          setStatus('Firebase conectado','ok');
-          cleanupExpiredRooms().catch(e=>console.warn('Limpieza parcial',e));
-          try {const remembered=localStorage.getItem('nexus.ultimaSala');
-            if(remembered&&!currentCode&&/^[A-HJ-NP-Z2-9]{6}$/.test(remembered))
-              db.ref(`salas/${remembered}`).once('value').then(s=>{const d=s.val();if(d?.jugadores?.[u.uid]&&!Core.shouldDelete(d,serverNow()))listen(remembered);else localStorage.removeItem('nexus.ultimaSala');}).catch(()=>{});
-          }catch(_){}
-        } else setStatus('Iniciando sesión…');
+          setStatus("Firebase conectado","ok");
+          statsRef=db.ref(`estadisticas/${u.uid}`);
+          statsCallback=snap=>updateStatsUI(snap.val()||{});
+          statsRef.on('value',statsCallback,err=>{console.warn('No se pudieron leer tus estadísticas',err);updateStatsUI({});});
+          cleanupExpiredRooms();reconcileCreatorStats().catch(e=>console.warn('No se pudieron reconciliar las estadísticas del creador',e));
+        }else{setStatus("Iniciando sesión…");updateStatsUI({});}
       });
       auth.signInAnonymously().catch(e=>{setStatus("Error de autenticación","bad");fail("No se pudo iniciar sesión anónima",e);});
       wire();
-      if(!timerInterval)timerInterval=window.setInterval(()=>{if(room?.juego)updateTimerUI(room.juego);updateRematchClock();},1000);
-      const lastResult=localStorage.getItem('nexus.ultimoResultado');
-      $('btn-ultimo-resultado')?.classList.toggle('hidden',!lastResult);
-      if('serviceWorker' in navigator && location.protocol==='https:')navigator.serviceWorker.register('service-worker.js').catch(e=>console.warn('Servicio offline no disponible',e));
-      console.log("NEXUS v1.02 cargado.");
+      if(!timerInterval)timerInterval=window.setInterval(()=>{if(room?.juego)updateTimerUI(room.juego);},1000);
+      console.log("NEXUS v1.01 cargado.");
     } catch(e) {setStatus("Error de configuración","bad");fail("No se pudo iniciar la aplicación",e);}
   }
   document.addEventListener("DOMContentLoaded",boot);

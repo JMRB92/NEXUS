@@ -4,29 +4,23 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#171717">
-  <meta name="description" content="NEXUS: juego de cartas estratégico multijugador para jugar desde el móvil.">
-  <link rel="icon" href="assets/favicon.png" type="image/png">
-  <link rel="apple-touch-icon" href="assets/icon-192.png">
-  <link rel="manifest" href="manifest.webmanifest">
   <title>NEXUS · Reinos en equilibrio</title>
-  <link rel="stylesheet" href="styles.css?v=102">
+  <link rel="stylesheet" href="styles.css?v=101">
   <script defer src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
   <script defer src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
   <script defer src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
   <script defer src="firebase-config.js?v=20261021fix2"></script>
-  <script defer src="nexus-core.js?v=102"></script>
-  <script defer src="app.js?v=102"></script>
+  <script defer src="app.js?v=101"></script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><img class="brand-icon" src="assets/icon-192.png" alt="Icono de NEXUS"><div><strong>NEXUS</strong><small>Reinos en equilibrio · Juego multijugador</small></div></div>
+    <div class="brand"><span class="brand-mark">✦</span><div><strong>NEXUS</strong><small>Reinos en equilibrio · Juego multijugador</small></div></div>
     <div id="estado-conexion" class="connection">Conectando…</div>
   </header>
 
   <main class="container">
     <section id="pantalla-inicio" class="screen">
       <div class="hero">
-        <img class="hero-logo" src="assets/nexus-logo.jpg" alt="NEXUS: personajes de fantasía enfrentándose en una batalla de energía roja y azul">
         <p class="eyebrow">LA GUERRA DEL NEXUS</p>
         <h1>Tu estrategia.<br><span>Tu poder. Tu victoria.</span></h1>
         <p class="muted">Crea una sala privada o únete a tus amigos con un código.</p>
@@ -37,11 +31,10 @@
         <div class="button-row home-help">
           <button id="btn-reglas" class="secondary">✦ Reglas de las cartas</button>
           <button id="btn-como-jugar" class="secondary">Cómo se juega</button>
-          <button id="btn-ultimo-resultado" class="secondary hidden" type="button">Último resultado</button>
         </div>
       </div>
       <div class="notice"><strong>La guerra del Nexus.</strong><p>Cuatro poderes luchan por una energía ancestral capaz de cambiar el destino de los reinos. No siempre vence el más fuerte: vence quien conoce a sus enemigos.</p></div><div class="notice"><strong>Una mesa. Muchas estrategias.</strong><p>Crea una sala privada, comparte el código de seis caracteres y juega con tus amigos. No necesitas crear una cuenta.</p></div>
-      <div id="modal-como-jugar" class="info-modal hidden" role="dialog" aria-modal="true" aria-label="Cómo se juega"><div class="info-modal-card"><button id="cerrar-como-jugar" class="modal-close" aria-label="Cerrar">×</button><p class="eyebrow">GUÍA DE PARTIDA</p><h2>Cómo se juega</h2><ol><li><b>Crear sala:</b> el anfitrión elige el número máximo de jugadores y los puntos necesarios para ganar. Comparte el código de seis caracteres.</li><li><b>Preparación:</b> antes de repartir, se quema una carta boca abajo. Se revela al finalizar la ronda. Cada jugador recibe una carta.</li><li><b>Tu turno:</b> roba una carta; tendrás dos. Elige una para jugar y conserva la otra. Los efectos se resuelven y el turno pasa automáticamente al siguiente jugador.</li><li><b>Objetivos:</b> cuando un efecto pide elegir a alguien, selecciona su nombre en el desplegable. Las cartas que permiten elegir a un protegido, como el Llorón (0), pueden hacerlo.</li><li><b>Eliminación:</b> si un efecto elimina a un jugador, pierde su carta y no participa más en esa ronda. Su nombre queda tachado. Volverá a recibir una carta al empezar la ronda siguiente.</li><li><b>Protección:</b> algunas cartas protegen hasta que comience de nuevo el turno de quien la jugó. Mientras tanto, no se le puede elegir como objetivo.</li><li><b>Final de ronda:</b> si queda un único jugador vivo, gana la ronda. Si se agota el mazo, los jugadores vivos comparan el valor de su carta; gana el valor mayor, aplicando los modificadores especiales. Un empate no da punto.</li><li><b>Puntuación:</b> el ganador de la ronda obtiene un punto. El Llorón puede dar un punto adicional si gana el jugador elegido.</li><li><b>Final de partida:</b> gana quien alcanza primero la puntuación objetivo. Se muestra la clasificación final de todos los participantes.</li></ol><p>Las cartas especiales pueden modificar estas reglas generales; consulta el catálogo para leer cada efecto. Juega con atención: a veces conviene conservar una carta de valor alto y otras veces usar su efecto antes de que sea demasiado tarde.</p></div></div>
+      <div id="modal-como-jugar" class="info-modal hidden" role="dialog" aria-modal="true" aria-label="Cómo se juega"><div class="info-modal-card"><button id="cerrar-como-jugar" class="modal-close" aria-label="Cerrar">×</button><p class="eyebrow">GUÍA DE PARTIDA</p><h2>Cómo se juega</h2><ol><li><b>Crear sala:</b> el anfitrión elige el número máximo de jugadores y los puntos necesarios para ganar. Comparte el código de seis caracteres.</li><li><b>Preparación:</b> antes de repartir, se quema una carta boca abajo. Se revela al finalizar la ronda. Cada jugador recibe una carta.</li><li><b>Tu turno:</b> roba una carta; tendrás dos. Elige una para jugar y conserva la otra. Los efectos se resuelven y el turno pasa automáticamente al siguiente jugador.</li><li><b>Objetivos:</b> cuando un efecto pide elegir a alguien, selecciona su nombre en el desplegable. Las cartas que permiten elegir a un protegido, como el Llorón (0), pueden hacerlo.</li><li><b>Eliminación:</b> si un efecto elimina a un jugador, pierde su carta y no participa más en esa ronda. Su nombre queda tachado. Volverá a recibir una carta al empezar la ronda siguiente.</li><li><b>Protección:</b> algunas cartas protegen hasta que comience de nuevo el turno de quien la jugó. Mientras tanto, no se le puede elegir como objetivo.</li><li><b>Final de ronda:</b> si queda un único jugador vivo, gana la ronda. Si se agota el mazo, los jugadores vivos comparan el valor de su carta; gana el valor mayor, aplicando los modificadores especiales. Un empate no da punto.</li><li><b>Puntuación:</b> el ganador de la ronda obtiene un punto. El Bufón puede dar un punto adicional si gana el jugador elegido.</li><li><b>Final de partida:</b> gana quien alcanza primero la puntuación objetivo. Se muestra la clasificación final de todos los participantes.</li></ol><p>Las cartas especiales pueden modificar estas reglas generales; consulta el catálogo para leer cada efecto. Juega con atención: a veces conviene conservar una carta de valor alto y otras veces usar su efecto antes de que sea demasiado tarde.</p></div></div>
     </section>
 
     <section id="pantalla-crear" class="screen hidden">
@@ -97,6 +90,6 @@
     <div id="modal-reglas" class="info-modal hidden" role="dialog" aria-modal="true" aria-label="Reglas del juego"><div class="info-modal-card rules-catalog"><button id="cerrar-reglas" class="modal-close" aria-label="Cerrar">×</button><p class="eyebrow">GUÍA COMPLETA</p><h2>Reglas de las cartas</h2><p>Pulsa cualquier carta para ampliarla y consultar su efecto. Dentro de la ficha puedes avanzar a la carta anterior o siguiente.</p><div id="catalogo-cartas" class="catalog-grid"></div></div></div>
     <div id="mensaje-global" class="global-message" role="status" aria-live="polite"></div>
   </main>
-  <footer><span>Prototipo privado · No introduzcas datos personales sensibles.</span><span class="app-version">NEXUS · v1.02</span></footer>
+  <footer><span>Prototipo privado · No introduzcas datos personales sensibles.</span><span class="app-stats">Tus partidas creadas: <strong id="estadisticas-creadas">0</strong> · Finalizadas: <strong id="estadisticas-finalizadas">0</strong></span><span class="app-version">NEXUS · v1.01</span></footer>
 </body>
 </html>

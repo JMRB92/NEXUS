@@ -1,100 +1,18 @@
 {
   "rules": {
     "salas": {
+      ".read": "auth != null",
+      ".write": "auth != null",
       ".indexOn": [
-        "creadaEn"
-      ],
-      ".read": "auth != null && query.orderByChild === 'creadaEn' && query.endAt != null && query.endAt <= now - 172800000 && query.limitToFirst != null && query.limitToFirst <= 50",
-      "$code": {
-        ".read": "auth != null && (!data.exists() || data.child('jugadores').child(auth.uid).exists() || data.child('estado').val() === 'esperando')",
-        ".write": "auth != null && ((!data.exists() && newData.exists() && newData.child('creadorUid').val() === auth.uid) || (data.exists() && newData.exists() && data.child('creadorUid').val() === auth.uid) || (data.exists() && !newData.exists() && (data.child('creadaEn').val() <= now - 172800000 || (data.child('juego/estado').val() === 'finalizada' && data.child('juego/finalizadaEn').isNumber() && now >= (data.child('primeraSolicitudRevanchaEn').isNumber() ? data.child('primeraSolicitudRevanchaEn').val() : data.child('juego/finalizadaEn').val()) + 600000)))",
-        ".validate": "newData.hasChildren(['codigo','creadorUid','creadaEn','jugadores','estado','maxJugadores']) && newData.child('codigo').val() === $code && newData.child('creadorUid').isString() && newData.child('maxJugadores').isNumber() && newData.child('maxJugadores').val() >= 2 && newData.child('maxJugadores').val() <= 8 && newData.child('creadaEn').isNumber() && ((data.exists() && newData.child('creadaEn').val() === data.child('creadaEn').val() && newData.child('creadorUid').val() === data.child('creadorUid').val()) || (!data.exists() && newData.child('creadaEn').val() >= now - 15000 && newData.child('creadaEn').val() <= now + 15000))",
-        "estado": {
-          ".read": "auth != null"
-        },
-        "creadaEn": {
-          ".read": "auth != null"
-        },
-        "creadorUid": {
-          ".read": "auth != null"
-        },
-        "maxJugadores": {
-          ".read": "auth != null"
-        },
-        "reingresoAbierto": {
-          ".read": "auth != null"
-        },
-        "jugadores": {
-          ".read": "auth != null",
-          "$uid": {
-            ".write": "auth != null && auth.uid === $uid && (( !data.exists() && data.parent().parent().child('estado').val() === 'esperando') || data.exists())",
-            ".validate": "newData.hasChildren(['uid','nombre','conectado']) && newData.child('uid').val() === $uid && newData.child('nombre').isString() && newData.child('nombre').val().length <= 20 && newData.child('nombre').val().length > 0 && !newData.child('nombre').val().matches(/[<>]/)"
-          }
-        },
-        "juego": {
-          ".write": "auth != null && data.exists() && newData.exists() && data.parent().child('jugadores').child(auth.uid).exists() && data.parent().child('estado').val() === 'jugando' && data.child('estado').val() === 'jugando' && newData.child('version').val() === data.child('version').val() + 1",
-          ".validate": "newData.hasChildren(['version','estado','turnoUid','puntos']) && newData.child('version').isNumber() && newData.child('version').val() >= 0"
-        },
-        "solicitudesRevancha": {
-          "$uid": {
-            ".write": "auth != null && $uid === auth.uid && root.child('salas').child($code).child('jugadores').child(auth.uid).exists() && root.child('salas').child($code).child('juego/estado').val() === 'finalizada' && (root.child('salas').child($code).child('primeraSolicitudRevanchaEn').isNumber() ? root.child('salas').child($code).child('primeraSolicitudRevanchaEn').val() : root.child('salas').child($code).child('juego/finalizadaEn').val()) + 600000 > now || auth != null && $uid === auth.uid && data.exists() && !newData.exists()",
-            ".validate": "newData.child('solicitada').val() === true && newData.child('nombre').isString()"
-          }
-        },
-        "primeraSolicitudRevanchaEn": {
-          ".write": "auth != null && root.child('salas').child($code).child('jugadores').child(auth.uid).exists() && root.child('salas').child($code).child('juego/estado').val() === 'finalizada' && (!data.exists() && newData.isNumber() && newData.val() >= now - 15000 && newData.val() <= now + 15000)"
-        },
-        "solicitudesReingreso": {
-          "$uid": {
-            ".read": "auth != null && (auth.uid === $uid || root.child('salas').child($code).child('creadorUid').val() === auth.uid)",
-            ".write": "auth != null && $uid === auth.uid && root.child('salas').child($code).child('estado').val() === 'jugando' && root.child('salas').child($code).child('reingresoAbierto').val() !== false",
-            ".validate": "newData.child('solicitanteUid').val() === $uid && newData.child('estado').val() === 'pendiente' && newData.child('objetivoUid').isString()"
-          }
-        }
-      }
+        "creadaEn",
+        "creadorUid"
+      ]
     },
-    "usuarioSalas": {
+    "estadisticas": {
       "$uid": {
         ".read": "auth != null && auth.uid === $uid",
         ".write": "auth != null && auth.uid === $uid"
       }
-    },
-    "limiteUsuarios": {
-      "$uid": {
-        ".read": "auth != null && auth.uid === $uid",
-        ".write": "auth != null && auth.uid === $uid",
-        "ultimaCreacionEn": {
-          ".validate": "newData.isNumber() && newData.val() <= now + 15000"
-        }
-      }
-    },
-    "estadisticasGlobales": {
-      "salasCreadas": {
-        ".read": false,
-        ".write": "auth != null && newData.isNumber() && newData.val() === (data.exists() ? data.val() : 0) + 1"
-      },
-      "partidasFinalizadas": {
-        ".read": false,
-        ".write": "auth != null && newData.isNumber() && newData.val() === (data.exists() ? data.val() : 0) + 1"
-      }
-    },
-    "eventosContabilizados": {
-      "$code": {
-        "$number": {
-          ".read": "auth != null && root.child('salas').child($code).child('jugadores').child(auth.uid).exists()",
-          ".write": "auth != null && root.child('salas').child($code).child('jugadores').child(auth.uid).exists() && root.child('salas').child($code).child('juego/estado').val() === 'finalizada' && !data.exists() && newData.val() === 1"
-        }
-      }
-    },
-    "salasFinalizadas": {
-      ".read": "auth != null && query.orderByChild === 'creadorUid' && query.equalTo === auth.uid",
-      "$code": {
-        ".write": "auth != null && ((root.child('salas').child($code).child('jugadores').child(auth.uid).exists() && root.child('salas').child($code).child('juego/estado').val() === 'finalizada') || (data.exists() && !newData.exists() && !root.child('salas').child($code).exists()) || root.child('salas').child($code).child('creadorUid').val() === auth.uid)",
-        ".validate": "newData.hasChildren(['creadaEn','finalizadaEn','creadorUid']) && newData.child('finalizadaEn').isNumber()"
-      },
-      ".indexOn": [
-        "creadorUid"
-      ]
     }
   }
 }
