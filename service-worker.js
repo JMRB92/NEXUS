@@ -1,5 +1,5 @@
-/* NEXUS v1.02 — cache exclusivo de arte; app y Firebase siempre vía red. */
-const CACHE='nexus-art-v102';
+/* NEXUS v1.02.1 — cache exclusivo de arte; app y Firebase siempre vía red. */
+const CACHE='nexus-art-v1021';
 self.addEventListener('install',event=>{self.skipWaiting();});
 self.addEventListener('activate',event=>{event.waitUntil(self.clients.claim());});
 self.addEventListener('fetch',event=>{
