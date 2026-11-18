@@ -2,9 +2,10 @@
   "rules": {
     "salas": {
       ".indexOn": [
-        "creadaEn"
+        "creadaEn",
+        "creadorUid"
       ],
-      ".read": "auth != null && query.orderByChild === 'creadaEn' && query.endAt != null && query.endAt <= now - 172800000 && query.limitToFirst != null && query.limitToFirst <= 50",
+      ".read": "auth != null && ((query.orderByChild === 'creadaEn' && query.endAt != null && query.endAt <= now - 172800000 && query.limitToFirst != null && query.limitToFirst <= 50) || (query.orderByChild === 'creadorUid' && query.equalTo === auth.uid))",
       "$code": {
         ".read": "auth != null && (!data.exists() || data.child('jugadores').child(auth.uid).exists() || data.child('estado').val() === 'esperando')",
         ".write": "auth != null && ((!data.exists() && newData.exists() && newData.child('creadorUid').val() === auth.uid) || (data.exists() && newData.exists() && data.child('creadorUid').val() === auth.uid) || (data.exists() && !newData.exists() && (data.child('creadaEn').val() <= now - 172800000 || (data.child('juego/estado').val() === 'finalizada' && data.child('juego/finalizadaEn').isNumber() && now >= (data.child('primeraSolicitudRevanchaEn').isNumber() ? data.child('primeraSolicitudRevanchaEn').val() : data.child('juego/finalizadaEn').val()) + 600000)))",

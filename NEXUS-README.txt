@@ -123,3 +123,12 @@ CORRECCIÓN v1.02.1 — CREACIÓN DE SALAS E INTERFAZ
 - Si también falla la creación directa de /salas/CODIGO, se muestra un mensaje
   junto al botón de crear. No se ocultan los errores de autorización reales.
 - El motor y las imágenes de las 27 cartas no se han modificado.
+
+NEXUS v1.03 — ARREGLO DE PERMISOS EN CREAR SALA
+------------------------------------------------
+La creación ya no depende de escrituras previas en usuarioSalas ni limiteUsuarios.
+Primero crea la sala; después intenta estadísticas e índices, sin bloquear el juego.
+Tras PERMISSION_DENIED, el error indica la ruta denegada para diagnóstico.
+Debes publicar firebase-rules.json de este ZIP en Firebase Console > Realtime Database > Reglas.
+Subir firebase-rules.json a GitHub NO modifica los permisos activos en Firebase.
+Consulta GUIA-ACTIVACION-FIREBASE-v1.03.md antes de actualizar producción.

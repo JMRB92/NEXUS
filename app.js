@@ -1,4 +1,4 @@
-/* NEXUS v1.02.1 — interfaz corregida y creación compatible con reglas heredadas; motor conservado.
+/* NEXUS v1.03 — creación robusta y diagnóstico por ruta; interfaz y motor conservados.
    Firebase Spark + GitHub Pages. La lógica del navegador NO es antifraude total. */
 (() => {
   "use strict";
@@ -16,24 +16,23 @@
   const indexedFinals = new Set();
   const serverNow=()=>Date.now()+serverOffset;
   const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-  // Compatibilidad controlada: subir archivos a GitHub NO instala las reglas de Firebase.
-  // Las reglas de v1.01 permiten crear salas pero niegan acceso a los índices nuevos.
-  // Si no existen esos permisos, usar límites locales y una consulta de salas propias;
-  // nunca confundir este modo con las protecciones completas de v1.02.
-  let legacyRulesMode=false, lastLegacyCreate=0;
+  // v1.03: los índices auxiliares NO pueden bloquear la creación de la sala.
+  // Los permisos de lectura/escritura de /salas/$code siguen siendo obligatorios.
+  let legacyRulesMode=false;
   const permissionDenied=e=>String(e?.code||'').toLowerCase().includes('permission_denied');
   function creationError(message='') {
     const el=$('crear-error');
     if(!el)return;
     el.textContent=message;el.classList.toggle('hidden',!message);
   }
-  function fallbackCreationCooldown() {
-    const now=serverNow();
-    let stored=lastLegacyCreate;
-    try{stored=Math.max(stored,Number(localStorage.getItem('nexus.ultimaCreacionLocal')||0));}catch(_){}
-    if(now-stored<CREATE_COOLDOWN_MS)throw new Error('Espera 20 segundos antes de crear otra sala.');
-    lastLegacyCreate=now;
-    try{localStorage.setItem('nexus.ultimaCreacionLocal',String(now));}catch(_){}
+  const CONFIRMED_CREATE_KEY='nexus.ultimaCreacionConfirmadaV103';
+  function checkLocalCooldown(){
+    let last=0;
+    try{last=Number(localStorage.getItem(CONFIRMED_CREATE_KEY)||0);}catch(_){}
+    if(serverNow()-last<CREATE_COOLDOWN_MS)throw new Error('Espera 20 segundos desde la última sala creada.');
+  }
+  function markSuccessfulCreation(){
+    try{localStorage.setItem(CONFIRMED_CREATE_KEY,String(serverNow()));}catch(_){}
   }
 
   function showScreen(id) {
@@ -82,55 +81,56 @@
       creadorUid:data.creadorUid, numeroPartida:Number(data.numeroPartida||1)
     });} catch(e){indexedFinals.delete(key);console.warn('No se pudo indexar la sala finalizada',code,e);}
   }
-  async function reserveCreationSlot(code) {
-    const list=db.ref(`usuarioSalas/${user.uid}`);
+  // Comprobaciones de solo LECTURA. Nunca escribe índices antes de crear la sala.
+  // Consultamos primero las salas del creador (v1.01 y reglas de v1.03).
+  // Si los permisos del servidor lo impiden, la restricción por UID queda
+  // temporalmente sin verificar, pero la creación legítima no se bloquea.
+  async function checkCreationLimits(){
+    checkLocalCooldown();
+    let active=null;
     try {
-      const snap=await list.once('value');
-      const known=snap.val()||{};
-      for(const oldCode of Object.keys(known)) {
-        const exists=await db.ref(`salas/${oldCode}`).once('value').then(s=>s.val()).catch(()=>null);
-        if(!exists || exists.estado==='cerrada' || Core.shouldDelete(exists,serverNow()))
-          await list.child(oldCode).remove().catch(()=>{});
-      }
-      const result=await list.transaction(value=>{
-        value=value||{};
-        if(value[code]||Object.keys(value).length>=ROOM_LIMIT)return;
-        value[code]=serverNow();return value;
-      },undefined,false);
-      if(!result.committed)throw new Error('Has alcanzado el máximo de tres salas activas.');
-      return true;
+      const snap=await db.ref('salas').orderByChild('creadorUid').equalTo(user.uid).once('value');
+      const records=snap.val()||{};
+      active=Object.values(records).filter(d=>d&&d.estado!=='cerrada'&&!Core.shouldDelete(d,serverNow())).length;
     } catch(e) {
       if(!permissionDenied(e))throw e;
       legacyRulesMode=true;
-      // Solo en compatibilidad con reglas de v1.01: consultar salas creadas
-      // por este usuario. Con reglas nuevas, esta lectura general no se concede.
       try {
-        const own=(await db.ref('salas').orderByChild('creadorUid').equalTo(user.uid).once('value')).val()||{};
-        const active=Object.values(own).filter(r=>r&&r.estado!=='cerrada'&&!Core.shouldDelete(r,serverNow()));
-        if(active.length>=ROOM_LIMIT)throw new Error('Has alcanzado el máximo de tres salas activas.');
-      } catch(readError) {
-        if(!permissionDenied(readError))throw readError;
-        // Si tampoco se permite la consulta, no fingimos que el límite está
-        // verificado. Lo advierte la consola, y se intenta crear la sala.
-        console.warn('No se pudo comprobar el límite de salas: publica las reglas v1.02.1.',readError);
+        const idx=(await db.ref(`usuarioSalas/${user.uid}`).once('value')).val()||{};
+        let count=0;
+        for(const code of Object.keys(idx)){
+          try {
+            const data=(await db.ref(`salas/${code}`).once('value')).val();
+            if(data&&data.estado!=='cerrada'&&!Core.shouldDelete(data,serverNow()))count++;
+          }catch(readError){
+            if(!permissionDenied(readError))throw readError;
+            // No contar un registro que el cliente no puede verificar.
+            console.warn('NEXUS: sala de índice sin permiso de lectura',code);
+          }
+        }
+        active=count;
+      } catch(indexError){
+        if(!permissionDenied(indexError))throw indexError;
+        console.warn('NEXUS: no se puede verificar el límite por UID con las reglas actuales.');
       }
-      return false;
     }
+    if(active!==null&&active>=ROOM_LIMIT)throw new Error('Has alcanzado el máximo de tres salas activas.');
   }
-  async function creationCooldown() {
-    const ref=db.ref(`limiteUsuarios/${user.uid}/ultimaCreacionEn`);
-    const now=serverNow();
-    try {
-      const result=await ref.transaction(previous=>{
-        if(Number(previous||0)>now-CREATE_COOLDOWN_MS)return;
-        return now;
-      },undefined,false);
-      if(!result.committed)throw new Error('Espera 20 segundos antes de crear otra sala.');
-    } catch(e) {
-      if(!permissionDenied(e))throw e;
-      legacyRulesMode=true;
-      fallbackCreationCooldown();
-    }
+  // Estos índices y estadísticas son secundarios: su error no invalida una sala
+  // que ya existe en Realtime Database.
+  async function recordSuccessfulCreation(code){
+    const tasks=[
+      ['usuarioSalas',db.ref(`usuarioSalas/${user.uid}/${code}`).set(firebase.database.ServerValue.TIMESTAMP)],
+      ['limiteUsuarios',db.ref(`limiteUsuarios/${user.uid}/ultimaCreacionEn`).set(firebase.database.ServerValue.TIMESTAMP)],
+      ['estadisticas',registerCreatedRoomOnce(code)]
+    ];
+    const results=await Promise.allSettled(tasks.map(([,p])=>p));
+    results.forEach((r,i)=>{
+      if(r.status==='rejected'){
+        if(permissionDenied(r.reason))legacyRulesMode=true;
+        console.warn('NEXUS: registro secundario no disponible:',tasks[i][0],r.reason);
+      }
+    });
   }
   async function commitGame(before, next, guard=()=>true) {
     const expected=Number(before.version||0);
@@ -706,33 +706,50 @@
     root.classList.remove('hidden');root.classList.add('event-pop');clearTimeout(visualTimer);
   }
   async function createRoom() {
-    if(busy)return;busy=true;say('');creationError('');$('btn-generar-partida').disabled=true;
-    let reserved=null;
+    if(busy)return;
+    busy=true;say('');creationError('');$('btn-generar-partida').disabled=true;
+    let stage='validar datos',createdCode=null;
     try {
       const name=Core.safeName($('nombre-creador').value);
       const max=Number($('numero-jugadores').value),target=Number($('puntos-objetivo').value);
       if(!Number.isInteger(max)||max<2||max>8)throw new Error('Elige entre 2 y 8 jugadores.');
       if(!Number.isInteger(target)||target<1||target>20)throw new Error('El objetivo debe estar entre 1 y 20 puntos.');
-      await ensureUser();await creationCooldown();
-      let code=null;
-      for(let i=0;i<10&&!code;i++) {
+      stage='autenticación anónima';
+      await ensureUser();
+      stage='comprobación de límites';
+      await checkCreationLimits();
+      // ÚNICA operación imprescindible para crear: transacción en la sala.
+      // La transacción requiere que Firebase permita leer y escribir
+      // /salas/CODIGO. Nunca se cambia por set() a ciegas: evita colisiones.
+      for(let i=0;i<10&&!createdCode;i++) {
         const candidate=randomCode(),ref=db.ref(`salas/${candidate}`);
-        await reserveCreationSlot(candidate);reserved=candidate;
-        const data={codigo:candidate,creadorUid:user.uid,versionCreacion:'1.02',numeroPartida:1,maxJugadores:max,puntosObjetivo:target,temporizadorActivo:$('temporizador-activo')?.value==='si',reingresoAbierto:true,estado:'esperando',creadaEn:firebase.database.ServerValue.TIMESTAMP,jugadores:{[user.uid]:{uid:user.uid,nombre:name,conectado:true,unidoEn:firebase.database.ServerValue.TIMESTAMP}}};
+        const data={codigo:candidate,creadorUid:user.uid,versionCreacion:'1.03',numeroPartida:1,maxJugadores:max,puntosObjetivo:target,temporizadorActivo:$('temporizador-activo')?.value==='si',reingresoAbierto:true,estado:'esperando',creadaEn:firebase.database.ServerValue.TIMESTAMP,jugadores:{[user.uid]:{uid:user.uid,nombre:name,conectado:true,unidoEn:firebase.database.ServerValue.TIMESTAMP}}};
+        stage=`transacción en /salas/${candidate}`;
         const claim=await ref.transaction(previous=>previous===null?data:undefined,undefined,false);
-        if(claim.committed){code=candidate;break;}
-        await db.ref(`usuarioSalas/${user.uid}/${candidate}`).remove().catch(()=>{});reserved=null;
+        if(claim.committed)createdCode=candidate;
       }
-      if(!code)throw new Error('No se pudo crear un código único.');
-      await registerCreatedRoomOnce(code);
-      listen(code);say('');
-      if(legacyRulesMode)console.warn('NEXUS funcionando con reglas Firebase antiguas. Para activar índices, protecciones y contadores, publica firebase-rules.json.');
+      if(!createdCode)throw new Error('No se pudo crear un código de sala único.');
+      markSuccessfulCreation();
+      stage='mostrar sala';
+      listen(createdCode);say('');
+      // Registrar estadísticas/índices DESPUÉS de crear y mostrar la sala.
+      // Evita reproducir el bloqueo de v1.02 cuando falta una regla auxiliar.
+      recordSuccessfulCreation(createdCode).catch(e=>console.warn('NEXUS: error en los índices secundarios',e));
     }catch(e){
-      if(reserved){const exists=await db.ref(`salas/${reserved}`).once('value').then(s=>s.exists()).catch(()=>true);if(!exists)await db.ref(`usuarioSalas/${user.uid}/${reserved}`).remove().catch(()=>{});}
-      fail('Error al crear la sala',e);
-      creationError(permissionDenied(e)
-        ? 'Firebase ha rechazado la creación. Revisa que la autenticación anónima esté activada y publica las reglas incluidas en firebase-rules.json.'
-        : String(e?.message||'No se ha podido crear la sala. Comprueba la conexión y vuelve a intentarlo.'));
+      console.error('NEXUS: error al crear sala',stage,e?.code||'',e?.message||e);
+      if(createdCode){
+        // La sala ya está creada; no afirmar lo contrario ni intentar crear otra.
+        say(`La sala ${createdCode} se ha creado, pero no se pudo abrir. Recarga la página y utiliza ese código.`);
+      }else if(permissionDenied(e)){
+        const message=`PERMISO DENEGADO en ${stage}. La operación necesita permisos de lectura y escritura en Firebase Realtime Database. Abre Firebase Console → Realtime Database → Reglas y PUBLICA firebase-rules.json de v1.03. Comprueba que Authentication → Anónimo esté activado. Subir las reglas a GitHub no actualiza Firebase.`;
+        say(message);creationError(message);
+      }else if(String(e?.code||'')==='auth/operation-not-allowed'){
+        const message='La autenticación anónima está desactivada en Firebase. Actívala en Firebase Console → Authentication → Método de acceso → Anónimo.';
+        say(message);creationError(message);
+      }else{
+        fail('Error al crear la sala',e);
+        creationError(String(e?.message||'No se ha podido crear la sala. Comprueba la conexión.'));
+      }
     }finally{busy=false;$('btn-generar-partida').disabled=false;}
   }
   async function joinRoom() {
@@ -1228,7 +1245,7 @@
       catch(e){console.warn('No hay almacenamiento local; los resultados no se conservarán al cerrar el navegador.',e);}
       $('btn-ultimo-resultado')?.classList.toggle('hidden',!lastResult);
       if('serviceWorker' in navigator && location.protocol==='https:')navigator.serviceWorker.register('service-worker.js').catch(e=>console.warn('Servicio offline no disponible',e));
-      console.log("NEXUS v1.02.1 cargado.");
+      console.log("NEXUS v1.03 cargado.");
     } catch(e) {setStatus("Error de configuración","bad");fail("No se pudo iniciar la aplicación",e);}
   }
   document.addEventListener("DOMContentLoaded",boot);
